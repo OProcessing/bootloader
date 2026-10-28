@@ -1,317 +1,212 @@
 # STM32F446RE Bootloader 예제
 
-STM32CubeIDE의 `bootFW`와 `AppFW` 프로젝트로 구성합니다. 2단계에서는
-공유 Metadata ABI, Flash 저널, 부팅 시도 제한, App 확인 처리를 추가했습니다.
-3단계는 IWDG, Reset Cause에 따른 실패 판정, 런타임 실패 누적과 상태 감시를 구현합니다.
-Recovery는 Bootloader `while` 대기로 유지하며 업데이트 통신은 추가하지 않습니다.
-4단계는 이미지 Header, 설치 시 전체 CRC, 조건부 재검증 및 Bootloader WRP를 추가합니다.
+Bootloader 및 Application 분리 예제.
+이미지 검증, 부팅 상태 저장, watchdog 기반 장애 감지, Bootloader 쓰기 보호를 구현한다.
 
-## 메모리 맵
+`bootFW`는 이미지 검증과 App 진입을 담당한다. `AppFW`는 초기화와 주 루프를 실행하고 부팅 결과를 기록한다.
+두 프로젝트는 독립적으로 빌드하며, 부팅 상태는 Flash의 Metadata 영역에 저장한다.
 
-| 영역 | 주소 범위 | 크기 | Erase 섹터 |
-|---|---|---|---|
-| Bootloader | `0x08000000–0x08007FFF` | 32 KiB | 0–1 |
-| Application | `0x08008000–0x0803FFFF` | 224 KiB | 2–5 |
-| Metadata A | `0x08040000–0x0805FFFF` | 128 KiB | 6 |
-| Metadata B | `0x08060000–0x0807FFFF` | 128 KiB | 7 |
+## 부팅 절차
 
-이전 App 352 KiB / Metadata 128 KiB 배치에서 변경했습니다. 같은 섹터 안의
-레코드 두 개는 섹터 삭제 중 전원이 끊기면 함께 사라집니다. 따라서 서로 독립적으로
-지울 수 있는 Sector 6, 7을 예약합니다. 링커와 `Shared/boot_state.h`가 같은 배치를 사용합니다.
-기존 Metadata와의 자동 마이그레이션은 없습니다. 최초에는 아래 절차로 다시 프로비저닝합니다.
+```mermaid
+flowchart TD
+    RESET["전원 인가 또는 리셋"] --> BOOT["Bootloader: 보호 설정과 App 검사"]
+    BOOT -->|"실행 가능"| APP["App 시작"]
+    BOOT -->|"이미지 오류 또는 실패 한도 도달"| REC["Bootloader에서 대기"]
+    APP -->|"2초 정상 진행"| OK["정상 부팅 확인: APP_OK"]
+    OK -->|"추가 30초 정상 진행"| STABLE["런타임 실패 횟수 초기화"]
+    APP -->|"멈춤"| WDG["Watchdog 리셋"]
+    OK -->|"멈춤"| WDG
+    STABLE -->|"멈춤"| WDG
+    WDG --> RESET
+```
 
-하드웨어 기준: [ST RM0390](https://www.st.com/resource/en/reference_manual/dm00135183.pdf).
-Flash 백엔드는 3.3 V 보드용 WORD programming / `FLASH_VOLTAGE_RANGE_3`
-(2.7–3.6 V) 설정을 사용합니다.
+Recovery 진입 시 Bootloader의 주 루프에서 대기하며 IWDG를 갱신한다.
+WRP를 새로 설정한 경우에도 대기 상태로 진입한다. 설정 반영에는 전원 재인가가 필요하다.
 
-## 부팅 흐름
+## 빌드 및 Flash 기록
 
-1. Bootloader `main()` 시작에서 `RCC->CSR`를 읽고 reset flags를 지웁니다.
-2. 두 Metadata 저널에서 commit과 CRC가 유효한 최신 sequence를 찾습니다.
-3. Header/Metadata 일치, SP, Thumb Reset Vector를 확인하고 CRC 정책에 따라 전체 이미지를 검사합니다.
-4. `APP_START`와 증가한 `boot_attempts`를 Flash에 저장하고 IWDG를 시작한 뒤 App으로 점프합니다.
-5. App 초기화 후 주 루프가 2초 동안 정상 진행하면 `Boot_Confirm()`이 `APP_OK`, attempts=0을 저장합니다.
-6. 확인 전에 리셋되면 다음 실행에서 재시도합니다. 최대 3번 App에 진입하며,
-   세 번째 시도도 확인 없이 리셋되면 다음 부팅에 `APP_FAIL`을 기록하고 Bootloader에 머뭅니다.
+### 1. 빌드와 초기 Metadata 준비
 
-전원 재인가, BOR, watchdog, software reset 등 모든 미확인 리셋은 시도를 소비합니다.
-현재 예제는 주 루프 작업 진행을 감시합니다. 실제 제품에서는 핵심 주변장치의 자체 진단을
-완료하고 각 필수 작업의 성공 지점에서 `AppHealth_Progress()`를 호출하도록 확장하세요.
-정상 확인 후의 다음 부팅은 attempts=1부터 다시 시작합니다.
+STM32CubeIDE에서 `bootFW`와 `AppFW`를 열고 Refresh 후 빌드한다.
+`Shared` 폴더는 두 프로젝트와 같은 상위 폴더에 둔다.
 
-## 3단계: 장애 감지와 복구 대기
+App 링크 후 FW Header의 크기·버전·CRC를 기록해야 한다.
+IDE의 post-build 설정에서 `tools/finalize_firmware.py`를 호출한다.
+Python 보조 도구는 Git 추적 대상에서 제외되어 있다. 새 clone 환경에서는 별도 준비가 필요하다.
 
-IWDG는 Bootloader가 App으로 점프하기 전에 시작하므로 Reset Handler와 초기화 중의
-무한 루프도 감시합니다. App은 직접 디버깅 진입도 지원하도록 `main()` 시작에서 같은
-설정을 다시 적용합니다. `/256`, reload=4095이므로 nominal 32 kHz LSI에서 timeout은
-32.768초이며 실제 시간은 LSI 오차에 따라 달라집니다. 시작한 IWDG는 system reset 전까지
-끌 수 없습니다. [ST RM0390 IWDG 설명](https://www.st.com/resource/en/reference_manual/dm00135183.pdf)을 기준으로 구현했습니다.
-Option Bytes는 기본 software-start watchdog (`WDG_SW=1`)을 전제로 하며 변경하지 않습니다.
-
-App은 SysTick ISR에서 watchdog을 갱신하지 않습니다. 필수 작업이 진행될 때만
-주 루프가 갱신하므로 주 루프/작업 정지, Error Handler, HardFault 등에서 갱신이 끊기면
-IWDG가 MCU를 리셋합니다. `Shared/app_health.h`의 기본 시간 정책은 다음과 같습니다.
-
-| 정책 | 기본값 | 동작 |
-|---|---|---|
-| 작업 진행 기한 | 1초 | 필수 작업이 기한을 놓치면 fault latch 후 갱신 중단 |
-| 부팅 안정 확인 | 2초 | 모든 필수 작업이 정상 진행한 뒤 Boot Confirm |
-| 확인 요청 제한 | 8초 | Health 감시 시작 후 Confirm이 처리되지 않으면 갱신 중단 |
-| 런타임 안정 확인 | Confirm 후 30초 | 런타임 실패 횟수 초기화 |
-
-8초 제한은 App의 Health 감시 시작 이후에 적용합니다. 그보다 앞선 Reset Handler나
-초기화 정지는 IWDG timeout으로 감지합니다. 성공한 동기 Metadata 작업의 대기 시간은
-`AppHealth_MaintenanceComplete()`로 소프트웨어 작업 기한/안정 시간에서 제외합니다.
-저장 중에는 IWDG를 갱신하지 않으므로 저장 자체가 멈추면 여전히 리셋됩니다.
-fault latch 후에는 작업 진행이 다시 보이더라도 갱신을 재개하지 않습니다.
-
-| 직전 Metadata 상태 | 이번 Reset Cause | 판정 |
-|---|---|---|
-| APP_START | IWDG/WWDG | 부팅 중 watchdog 실패 |
-| APP_START | POR/BOR | 부팅 확인 전 전원 중단 |
-| APP_START | 그 외 (software/pin/unknown 등) | 부팅 확인 전 리셋 |
-| APP_OK | IWDG/WWDG | Confirm 이후 런타임 watchdog 실패 |
-| APP_OK | POR/BOR/software/pin 등 | 런타임 실패를 추가하지 않음 |
-
-POR/BOR와 watchdog flag가 동시에 있으면 전원 이벤트로 우선 분류하고 원본 bitmask도
-보존합니다. 초기 등록 후 아직 실행 이력이 없는 이미지는 이전 런타임 실패로 오인하지 않습니다.
-이전 APP_START가 있으면 전원/수동 리셋도 기존 정책대로 부팅 시도를 소비합니다.
-
-`boot_attempts`는 Confirm에서 0으로 되돌리지만 `runtime_failures`는 유지합니다.
-Confirm 직후 반복해서 watchdog 리셋되는 App은 런타임 실패가 3회 누적되면 차단합니다.
-이 횟수는 정상 동작 30초를 채워야 초기화되며 전원 재인가나 수동 리셋만으로 지워지지 않습니다.
-부팅 3회 실패도 기존대로 차단합니다. `last_failure`는 마지막 세부 원인을 유지하고
-`failure_reason`은 현재 APP_FAIL/재시도의 원인을 나타냅니다.
-
-차단되거나 유효한 이미지/Metadata가 없으면 `boot_recovery_mode=1`로 Bootloader의
-`while`에서 대기합니다. 이 루프는 IWDG를 갱신하여 대기를 유지합니다. 새 전송 프로토콜이나
-자동 업데이트/재점프는 수행하지 않습니다. 이것이 이 예제의 Recovery 범위입니다.
-
-## Metadata 저장 규칙
-
-`Shared/boot_state.h`의 `BootMetadata`는 64바이트 고정 구조체입니다.
-4단계 형식 버전은 **2**입니다. 기존 버전 1 레코드는 사용하지 않으므로 최초 전환 시
-새 App과 Metadata를 함께 다시 기록하세요. 신규 이미지는 `APP_READY`로 등록하며,
-실제 부팅 확인을 받은 경우에만 `APP_OK`가 됩니다.
-
-- `boot_state`, `fw_version`, `fw_crc32`, `fw_size`
-- `boot_attempts`, `total_boots`
-- `runtime_failures`, `last_failure`: 기존 2단계 reserved 두 word를 사용하므로 64바이트 ABI와 CRC 위치 유지
-- `reset_flags`: RCC CSR 원본, `reset_causes`: POR/BOR/IWDG/WWDG/software/pin/low-power 비트마스크
-- `failure_reason`, `sequence`, 형식 버전, Metadata 자체 CRC32, 마지막 commit word
-
-reset flags는 동시에 여러 개가 설정될 수 있으므로 단일 원인으로 임의 축약하지 않습니다.
-`fw_version`은 명시한 uint32 값으로 저장하며 버전 비교나 downgrade 제한은 아직 없습니다.
-CRC는 CRC-32/ISO-HDLC (반사 다항식 `0xEDB88320`, init/xorout `0xFFFFFFFF`)이고
-Python `zlib.crc32()`와 같은 알고리즘입니다. 이미지 CRC는 아래의 CRC 필드 정규화 규칙을
-적용한 바이트열을 대상으로 하며, 원본 BIN에 바로 `zlib.crc32()`한 값과 다릅니다.
-Metadata 레코드 CRC는 이전과 동일하게 앞의 56바이트를 대상으로 합니다.
-
-레코드를 순차 추가하고 마지막에 commit word를 기록합니다. 쓰기 중 전원이 끊긴
-레코드는 무시합니다. 현재 섹터가 차면 **다른 섹터만 지운 후** 새 레코드를 기록하므로,
-지우는 도중 또는 기록 중 리셋되어도 이전의 유효한 레코드가 남습니다. 매 부팅마다
-섹터를 지우지는 않습니다. sequence wrap도 처리합니다.
-
-유효한 레코드가 없으면 자동으로 새 CRC를 계산해 정상 이미지로 등록하지 않습니다.
-`BOOT_EMPTY` 또는 `BOOT_CORRUPT`로 정지합니다. 최초 등록 도중 전원이 끊겨 유효한
-레코드가 하나도 남지 않은 경우에도 외부 프로비저닝을 다시 수행해야 합니다.
-CRC는 손상 검사용이며 서명이나 펌웨어 인증 기능은 아닙니다.
-
-## 빌드와 최초 Flash 기록
-
-STM32CubeIDE에서는 두 프로젝트를 Refresh한 뒤 빌드합니다. 새 파일
-`Core/Src/boot_state_port.c`가 빌드 대상에 들어갔는지 확인하세요. 이 파일이
-`Shared`의 동일 소스를 포함하므로 두 프로젝트에 별도 복사본을 관리하지 않습니다.
-`Shared` 디렉터리도 프로젝트와 같은 상위 폴더에 유지해야 합니다.
-
-IDE의 자동 생성 Makefile을 수정하지 않는 별도 빌드 도구도 제공합니다.
-프로젝트 루트의 PowerShell에서 실행합니다. GNU Arm GCC가 PATH에 없으면
-`C:/ST`의 STM32CubeIDE 설치를 탐색하며, `--toolchain <tools/bin>`으로 지정할 수도 있습니다.
+로컬 도구가 있는 환경의 빌드 및 초기 Metadata 생성 명령:
 
 ```powershell
-python tools/build_firmware.py
+python tools/build_firmware.py --fw-version 0x00010000
 python tools/provision_metadata.py build/AppFW/AppFW.bin --fw-version 0x00010000
 ```
 
-처음 설치할 때 STM32CubeProgrammer 등에서 다음 순서로 기록합니다.
+IDE 빌드도 Header 기록과 Metadata 생성이 필요하다.
+IDE post-build의 기본 버전은 `0x00010000`이며 Metadata에 지정한 버전과 일치해야 한다.
+Header가 미완성인 ELF/BIN은 이미지 검증에서 실패한다.
 
-1. Sector 0–7을 삭제합니다. **이 전체 삭제는 최초 설치용이며 기존 상태를 초기화합니다.**
-2. `build/bootFW/bootFW.bin` → `0x08000000`
-3. `build/AppFW/AppFW.bin` → `0x08008000`
-4. `build/provision/metadata_a.bin` → `0x08040000`
-5. `build/provision/metadata_b.bin` → `0x08060000`
-6. 모든 쓰기가 끝난 다음 reset/run 합니다.
+### 2. Flash 기록
 
-두 초기 레코드는 APP_READY 상태의 같은 이미지 정보를 가지며 sequence는 A=1, B=0입니다.
-Metadata 생성에 사용한 **동일한 App .bin**을 기록해야 합니다. App 재빌드/변경 후에는
-새 CRC와 크기로 Metadata도 다시 생성해야 합니다. 기존 저널 위에 초기 64바이트만
-덮어쓰면 안 됩니다. 외부 재등록 시 Sector 6, 7을 모두 지우고 초기 레코드를 기록하세요.
-업데이트 시 전체 삭제를 사용하면 Bootloader와 Metadata도 사라집니다.
+최초 설치 시 전체 Flash를 삭제한 뒤 STM32CubeProgrammer 등으로 다음 파일을 기록한다.
+기존 WRP가 적용된 보드는 Sector 0·1의 보호 해제가 필요하다. 관련 절차는 오류 진단 항목에 기재한다.
 
-IDE에서 만든 ELF를 사용한다면 같은 툴체인의 `arm-none-eabi-objcopy -O binary`
-명령으로 `.bin`을 추출하여 생성 도구에 전달할 수 있습니다. 별도 빌드의 출력은
-`Debug`가 아닌 `build`에 있으므로 서로 다른 빌드 결과를 섞지 마세요.
+| 파일 | 기록 시작 주소 | 예약 영역 |
+|---|---|---|
+| `build/bootFW/bootFW.bin` | `0x08000000` | 32 KiB, Sector 0–1 |
+| `build/AppFW/AppFW.bin` | `0x08008000` | 224 KiB, Sector 2–5 |
+| `build/provision/metadata_a.bin` | `0x08040000` | 128 KiB, Sector 6 |
+| `build/provision/metadata_b.bin` | `0x08060000` | 128 KiB, Sector 7 |
 
-## 4단계: FW Header와 무결성
+Metadata는 Flash에 기록할 App BIN을 기준으로 생성한다.
+App 재빌드 시 Metadata도 재생성해야 한다. 외부에서 Metadata를 재등록할 때는 Sector 6·7을 모두 삭제한 뒤 기록한다.
+현재 Metadata 형식은 버전 2이며 이전 버전과 호환되지 않는다.
 
-벡터 테이블은 기존 `0x08008000`을 유지하며, Header는 이미지 offset `0x200`,
-즉 `0x08008200`에 32바이트로 배치합니다. 코드는 Header 뒤에서 시작합니다.
-링커 ASSERT가 벡터 테이블과 Header의 중복 및 Header 크기를 확인합니다.
+### 3. 정상 실행 확인
 
-| Header 필드 | 의미 |
+WRP를 새로 설정한 경우 전원을 완전히 차단한 뒤 재인가한다.
+실행 상태는 다음 변수로 확인한다. LED 및 UART 상태 출력은 미구현이다.
+
+| 확인할 값 | 정상 결과 |
 |---|---|
-| `magic` | `0x4657494D` |
-| `format_version` | Header 형식 1 |
-| `image_size` | Flash에 기록할 BIN 전체 크기 |
-| `fw_version` | 명시한 uint32 버전 |
-| `image_crc32` | 전체 이미지 CRC32 |
-| `header_crc32` | Header 자체 CRC32 |
-| `load_address` | `0x08008000` |
-| `header_size` | 32 |
+| App의 `app_main_heartbeat` | 주 루프가 돌면서 증가 |
+| App의 `app_confirm_result` | 약 2초 안정 동작 후 `BOOT_SUCCESS` |
+| App의 `app_runtime_result` | Confirm 후 30초 안정 동작 시 `BOOT_SUCCESS` |
+| 최신 Metadata의 `boot_state` / `boot_attempts` | `APP_OK` / `0` |
 
-이미지 CRC는 벡터, Header, 코드, 상수, RAM 초기값 및 BIN 안의 간격을 모두 포함합니다.
-CRC 자기 참조를 피하기 위해 image_crc32와 header_crc32의 8바이트만 **0으로 간주**합니다.
-Header CRC는 header_crc32 한 필드만 0으로 간주하여 image_crc32 값까지 보호합니다.
-Header의 크기·버전·이미지 CRC는 Metadata 값과도 일치해야 합니다.
+Bootloader의 `boot_metadata`는 App 진입 전 스냅샷이다.
+Confirm 이후 상태는 `Boot_MetadataRead()` 또는 Flash의 최신 레코드로 확인한다.
 
-`Boot_InstallImage(version, size, crc)`는 실제 Flash 전체 이미지의 CRC를 계산합니다.
-Header, SP, Reset Vector, 전체 CRC가 모두 통과한 후에만 APP_READY를 저장합니다.
-전송/Flash 기록을 완료한 업데이트 경로에서 호출할 API이며, 이 단계에 통신 기능은 없습니다.
-외부 기록용 `provision_metadata.py`도 Header와 전체 CRC를 검증한 BIN만 받습니다.
+## 상태 관리 및 장애 감지
 
-### 빌드 후 Header 채우기
+### 부팅 상태
 
-`tools/build_firmware.py --fw-version 0x00010000`은 링크 후 `finalize_firmware.py`를 실행해
-**App ELF와 BIN 양쪽을** 수정합니다. IDE에서도 Debug/Release 설정의 post-build 명령에
-동일 처리를 추가했습니다. 기본 버전은 `0x00010000`이며 IDE에서는 post-build 명령의
-`--version` 값을 바꾸세요. Metadata 생성 시에도 같은 버전을 지정해야 합니다.
-
-이미 생성된 ELF를 수동 마무리할 경우:
-
-```powershell
-python tools/finalize_firmware.py AppFW/Debug/AppFW.elf --version 0x00010000 --objcopy "C:/ST/.../tools/bin/arm-none-eabi-objcopy.exe"
-python tools/provision_metadata.py AppFW/Debug/AppFW.bin --fw-version 0x00010000
+```mermaid
+stateDiagram-v2
+    [*] --> APP_READY: 이미지 검증 후 등록
+    APP_READY --> APP_START: 실행 시도 기록
+    APP_START --> APP_OK: App이 정상 부팅 확인
+    APP_START --> APP_START: 확인 전 리셋, 재시도 가능
+    APP_START --> APP_FAIL: 실행 시도 한도 도달
+    APP_OK --> APP_START: 다음 부팅 허용
+    APP_OK --> APP_FAIL: 런타임 실패 한도 도달
+    APP_FAIL --> APP_READY: 이미지 명시적 재등록
 ```
 
-첫 명령은 실제 설치된 objcopy 경로로 바꿔 실행합니다. IDE의 자동 post-build 처리에
-실패했다면 원본 ELF를 다운로드하지 말고 오류를 해결하거나 위 명령을 실행하세요.
-링크 직후의 미완성 Header는 size/CRC=0이므로 Bootloader가 거부합니다.
+`APP_READY`는 이미지 등록 완료, `APP_START`는 실행 시도 중, `APP_OK`는 부팅 확인 완료, `APP_FAIL`은 실행 차단 상태다.
+이미지 검증 실패도 실행 차단 조건에 해당한다. 유효한 Metadata가 없으면 새 상태를 생성하지 않고 Recovery로 진입한다.
 
-### 조건부 CRC 정책
+부팅 실패와 런타임 실패는 별도 카운터로 관리한다.
 
-Header 자체 CRC, Header/Metadata 일치와 벡터 범위 검사는 매 부팅 수행합니다.
-전체 이미지 CRC는 다음 조건으로 결정합니다.
+| 구분 | 판단 기준 | 차단 및 초기화 |
+|---|---|---|
+| 부팅 실패 | `APP_START`에서 Confirm 없이 리셋 | 최대 3회 실행 시도. 세 번째도 미확정이면 다음 부팅 차단. Confirm 성공 시 횟수 초기화 |
+| 런타임 실패 | `APP_OK` 이후 IWDG/WWDG 리셋 | 3회 누적 시 차단. Confirm만으로 지우지 않고 이후 30초 정상 동작 시 초기화 |
 
-| 조건 | 전체 CRC |
+Confirm 이전의 전원 중단 및 수동 리셋도 부팅 시도를 소비한다.
+Confirm 이후의 전원·수동 리셋은 런타임 실패 횟수를 증가시키거나 초기화하지 않는다.
+POR/BOR와 watchdog flag가 동시에 설정된 경우 전원 리셋으로 우선 분류한다.
+
+### 작업 진행 감시 및 IWDG
+
+App 주 루프에서 작업 진행 시각을 기록하고 상태를 검사한다.
+
+```c
+AppHealth_Progress(&app_health, APP_HEALTH_MAIN_TASK, now);
+app_health_action = AppHealth_Poll(&app_health, now);
+// 판정 결과가 정상일 때만 Boot_WatchdogFeed() 호출
+```
+
+`AppHealth_Progress()`는 작업 완료 또는 정상 진행 지점에서 호출한다.
+감시 대상은 현재 주 루프 하나이며, `Task`는 논리적인 작업 구분에 사용한다. RTOS 의존성은 없다.
+
+| 설정 | 현재 값 | 의미 |
+|---|---|---|
+| 작업 진행 기한 | 1초 | 필수 작업의 보고가 1초 초과 지연되면 Feed 중단 |
+| 부팅 확인 | 2초 | 모든 필수 작업이 보고된 뒤 안정적으로 진행하면 Confirm |
+| 부팅 확인 제한 | 8초 | Health 감시 시작 후 Confirm 미처리 시 Feed 중단 |
+| 런타임 안정 구간 | Confirm 후 30초 | 런타임 실패 횟수 초기화 |
+| IWDG timeout | nominal 약 32.8초 | 마지막 Feed 이후 카운터가 소진되면 MCU 리셋 |
+
+작업 진행 기한 초과 시 IWDG 갱신을 중단한다. MCU 리셋은 마지막 갱신 이후 IWDG timeout이 경과하면 발생한다.
+장애가 latch되면 이후 진행 보고가 들어와도 갱신을 재개하지 않는다.
+성공한 동기 Metadata 처리 시간은 Health 기한 계산에서 제외한다. 해당 처리 중에도 IWDG는 동작한다.
+
+### Metadata 저장
+
+Metadata는 부팅 상태·이미지 정보·실패 횟수를 포함하는 64바이트 레코드다.
+새 레코드를 빈 슬롯에 추가하고 마지막에 `commit`을 기록한다. 읽기 시 CRC와 commit이 유효한 최신 레코드를 선택한다.
+
+현재 섹터에 빈 슬롯이 없으면 반대편 섹터를 삭제하고 기록한다. 삭제·기록 중 전원 차단에 대비해 이전 최신 레코드가 있는 섹터는 유지한다.
+최초 등록 중 유효한 레코드가 하나도 남지 않은 경우 외부 재등록이 필요하다.
+
+### 이미지 검증
+
+FW Header는 App의 `0x08008200`에 배치되는 32바이트 구조체다.
+Magic·크기·버전·CRC·적재 주소를 포함한다. 부팅 시 Header와 Metadata의 이미지 정보가 일치하는지 검사한다.
+
+| 상황 | 전체 이미지 CRC |
 |---|---|
-| 설치 API, 최초 APP_READY, Confirm 미완료 APP_START 재시도 | 수행 |
-| POR/BOR, IWDG/WWDG, low-power, 알 수 없는 Reset Cause | 수행 |
-| 런타임 실패 횟수가 남아 있는 경우 | 수행 |
-| 주기적 재검증 (이전 total_boots가 16의 배수) | 수행 |
-| `Boot_PrepareEx(flags, 1, &metadata)` 강제 요청 | 수행 |
-| APP_OK이며 위 조건이 없고 software/pin reset만 있는 경우 | 생략 |
+| 설치 직후, 최초 부팅, 미확인 부팅 재시도 | 검사 |
+| 전원·저전압·watchdog·원인 불명 등의 리셋 | 검사 |
+| 런타임 실패 기록이 남아 있음, 주기적 재검증 시점, 강제 요청 | 검사 |
+| Confirm된 App의 software/pin 리셋이며 위 조건이 없음 | 생략 |
 
-`Boot_Confirm()`은 Header와 벡터를 확인하지만 직전 Bootloader 검증을 반복해 전체 CRC를
-다시 계산하지 않습니다. `Boot_VerifyFirmware()`는 수동 진단용으로 항상 전체 CRC를
-확인하며, 실패 결과를 반환할 뿐 상태를 직접 변경하지는 않습니다. 부팅 차단까지 하려면
-`Boot_PrepareEx()`의 강제 검증을 사용하세요.
+Header와 벡터 검사는 매 부팅 수행한다. 전체 CRC를 생략한 재부팅에서는 본문 손상이 다음 전체 검사까지 검출되지 않을 수 있다.
+서명 기반 이미지 인증은 미구현이다.
 
-검사를 생략한 warm reset에서는 본문에만 생긴 손상이 다음 전체 검사까지 발견되지 않을 수
-있습니다. 이 지연을 허용하지 않는 정책은 `Boot_PrepareEx()`에서 항상 force_crc=1을 사용하세요.
-CRC는 우발적 손상 검증이며 서명 기반 인증/변조 방지 기능은 아닙니다.
+## 소스 구성
 
-### Bootloader Write Protection
+| 순서 | 파일 | 구현 내용 |
+|---|---|---|
+| 1 | [bootFW/main.c](bootFW/Core/Src/main.c) | 부팅 판단 → App 점프 또는 대기 |
+| 2 | [AppFW/main.c](AppFW/Core/Src/main.c) | 작업 진행 보고 → Confirm → Feed |
+| 3 | [boot_state.c](Shared/boot_state.c) | Metadata 저장, 실패 판정, CRC 정책 |
+| 4 | [app_health.c](Shared/app_health.c) / [boot_watchdog_stm32.c](Shared/boot_watchdog_stm32.c) | 작업 기한 검사와 IWDG 제어 |
+| 5 | [boot_protection.c](bootFW/Core/Src/boot_protection.c) | Bootloader 쓰기 보호 |
 
-Bootloader는 `Boot_Prepare()` 전에 `Boot_ProtectBootloader()`를 호출합니다.
-SPRMOD=0의 WRP 모드에서 Sector 0·1의 nWRP bit를 0으로 설정하며,
-다른 섹터의 WRP, RDP, BOR, watchdog 옵션은 그대로 둡니다.
-이미 보호된 경우에는 Option Bytes를 다시 쓰지 않습니다.
-SPRMOD=1 (PCROP)이면 모드를 자동 변경하지 않고 Recovery에서 정지합니다.
+메모리 주소와 실패 한도는 [boot_state.h](Shared/boot_state.h), Health 시간 설정은 [app_health.h](Shared/app_health.h)에 정의한다.
 
-보호되지 않은 보드의 첫 실행에서는 Option Bytes를 저장하고
-`boot_protection_result=BOOT_PROTECTION_POWER_CYCLE_REQUIRED` 상태로 Recovery에서 대기합니다.
-**전원을 완전히 껐다 켜서 Option Bytes를 다시 로드**한 뒤 정상 부팅을 확인하세요.
-F446의 `HAL_FLASH_OB_Launch()`는 OPTSTRT 기록/대기를 수행하며 자동 reset 함수가 아닙니다.
-하드웨어 기준은 [ST RM0390 Flash 옵션 설명](https://www.st.com/resource/en/reference_manual/dm00135183.pdf)입니다.
+## 오류 진단
 
-WRP가 적용되면 IDE에서 Bootloader를 다시 기록하거나 전체 삭제할 때 보호 오류가 발생할 수
-있습니다. 개발 중 Bootloader 갱신은 STM32CubeProgrammer의 Option Bytes에서
-Sector 0·1의 WRP만 해제하고 필요한 섹터를 기록한 후 실행하세요. 새 Bootloader가 다시
-보호를 설정하면 전원 재인가가 필요합니다. RDP나 PCROP 옵션은 변경하지 마세요.
-보드 연결을 통한 Option Bytes 기록/보호 위반 시험은 별도 수행해야 합니다.
-
-## API와 관찰할 변수
-
-| API | 용도 |
+| 증상 | 확인 항목 |
 |---|---|
-| `Boot_MetadataRead()` | CRC/commit이 유효한 최신 레코드 읽기 |
-| `Boot_MetadataWrite()` | 새 sequence와 CRC를 붙여 append; 저수준 API |
-| `Boot_Prepare()` | 이미지 검증 및 APP_START/시도 횟수 저장 |
-| `Boot_PrepareEx(flags, force_crc, out)` | CRC 강제 검증 선택을 포함한 부팅 준비 |
-| `Boot_VerifyFirmware()` | Header/Metadata/벡터/전체 CRC 수동 검사 |
-| `Boot_Confirm()` | App 정상 확인; APP_OK 및 횟수 초기화; 중복 호출은 추가 쓰기 없음 |
-| `Boot_RuntimeHealthy()` | APP_OK에서 장시간 정상 동작 확인 후 런타임 실패 횟수만 초기화 |
-| `Boot_MarkFailed()` | App 자체 진단 실패 시 APP_FAIL 영구 기록 |
-| `Boot_InstallImage(version, size, crc)` | 향후 업데이트 경로에서 새 이미지 검증 후 등록 및 횟수 초기화 |
+| 첫 실행이 Bootloader에서 멈춤 | `boot_protection_result`가 전원 재인가 요청인지 확인 |
+| 계속 Bootloader에서 대기 | `boot_result`와 `boot_recovery_mode` 확인. Metadata·Header·CRC·실패 횟수 검사 |
+| App 변경 후 실행 불가 | 같은 App BIN으로 Metadata를 다시 생성했는지 확인 |
+| 빌드 후 Python 파일 오류 | Git에서 제외된 로컬 도구가 있는지, post-build 경로가 맞는지 확인 |
+| Bootloader 재기록/전체 삭제 실패 | STM32CubeProgrammer에서 Sector 0·1의 WRP만 해제한 뒤 기록. 실행 후 다시 보호되면 전원 재인가 |
+| 디버깅 중 watchdog 리셋이 안 보임 | IWDG freeze 설정 확인. CPU를 계속 실행한 상태에서 시험 |
 
-설치 API는 명시적 복구/업데이트 시에만 사용하며 매 부팅마다 호출하지 않습니다.
-이미 APP_FAIL인 이미지는 자동 재시도하지 않습니다. 복구에는 검증된 이미지 재등록이 필요합니다.
-새 이미지 기록 자체의 전원 차단 안전성 및 전송 프로토콜은 이 단계의 범위가 아닙니다.
-
-Flash 쓰기 API는 인터럽트가 활성화되고 HAL SysTick이 실행 중인 thread mode에서만
-호출합니다. ISR이나 동시 호출은 지원하지 않습니다. 두 프로젝트는 동시에 실행되지 않으며,
-Bootloader는 Metadata 쓰기를 끝낸 후 IRQ/SysTick/NVIC를 정리하고 App으로 분기합니다.
-
-디버거에서 Bootloader의 `boot_result`, `boot_metadata`, `boot_reset_flags`,
-`boot_reset_causes`, `boot_recovery_mode`, App의 `app_confirm_result`,
-`app_runtime_result`, `app_health`, `app_health_action`, `app_main_heartbeat`를 관찰하세요. 정상 실행 결과는
-`app_confirm_result == BOOT_SUCCESS`이고, Flash 최신 상태는 `APP_OK`, attempts=0입니다.
-Bootloader의 `boot_metadata`는 점프 전 스냅샷이므로 App 확인 후 상태는
-`Boot_MetadataRead()`나 Flash의 최신 레코드로 확인해야 합니다.
-보호 관련 대기 원인은 `boot_protection_result`로 확인합니다.
+WRP는 Sector 0·1에만 적용하며 RDP·BOR·watchdog 옵션은 변경하지 않는다.
+PCROP 모드인 경우 보호 모드를 변경하지 않고 Recovery로 진입한다.
 
 ## 검증
 
-호스트 테스트는 NOR Flash의 1→0 기록 제약을 모사합니다. MinGW GCC 예시:
+호스트 테스트는 상태 전이와 Flash 오류를 모사한다. 실제 보드의 전원 차단·IWDG timeout·쓰기 보호 검증은 별도 수행해야 한다.
 
 ```powershell
 New-Item -ItemType Directory -Path build/tests -Force
 gcc -std=c11 -O2 -Wall -Wextra -Werror Shared/boot_state.c tests/test_boot_state.c -o build/tests/test_boot_state.exe
-./build/tests/test_boot_state.exe build/AppFW/AppFW.bin build/provision/metadata_a.bin
+./build/tests/test_boot_state.exe
 gcc -std=c11 -O2 -Wall -Wextra -Werror Shared/app_health.c tests/test_app_health.c -o build/tests/test_app_health.exe
 ./build/tests/test_app_health.exe
 gcc -std=c11 -O2 -Wall -Wextra -Werror -Itests/protection_mock bootFW/Core/Src/boot_protection.c tests/test_boot_protection.c -o build/tests/test_boot_protection.exe
 ./build/tests/test_boot_protection.exe
-python tests/test_firmware_tools.py
 ```
 
-상태 전이, 3회 재시도, 확인 후 초기화, 이미지/Metadata CRC 오류, reset cause 비트,
-sequence wrap, append/섹터 교체/confirm 중 80가지 word 기록 중단과 섹터 삭제 중단을 검사합니다.
-실제 ARM App 바이너리와 Python 생성 Metadata를 C 코드로 읽어 boot/confirm하는 호환성도 확인합니다.
-3단계 테스트는 시작/런타임 reset 판정, 각각의 실패 임계값, 안정 구간 후 초기화,
-런타임 정상 기록 중 16가지 추가 중단, 다중 작업 기한, fault latch, tick wrap,
-Flash 작업의 기한 처리를 확인합니다.
-4단계는 Header 각 바이트 손상, 이미지/Metadata 불일치, 설치 실패 시 미등록,
-일반/비정상/강제/주기적 CRC 경로, ELF/BIN Header 일치와 Python/C 호환성을 검사합니다.
-WRP는 모의 HAL로 대상 섹터·다른 옵션 보존·오류 시 lock 복원을 검사하며,
-실제 보드에서는 Option Bytes 확인과 Sector 0·1 쓰기 거부를 추가 확인해야 합니다.
+`tests/protection_mock/stm32f4xx_hal.h`는 호스트 테스트용이며 펌웨어 include 경로에서 제외한다.
+보드 시험 시 `app_fault_injection=1`은 무한 루프, `2`는 작업 진행 보고 중단을 발생시킨다. 리셋 후 값은 0이다.
+Confirm 이전과 이후에 각각 주입하여 부팅 실패와 런타임 실패 판정을 검증한다.
 
-실제 보드에서는 초기화 후 각 reset 원인, Metadata 쓰기/섹터 교체 중 전원 차단을 확인합니다.
-자동화된 Flash 모사는 실제 저전압 시 Flash 동작을 대체하지 않습니다.
+### 구현 조건
 
-3단계 보드 시험은 새 App을 빌드한 뒤 같은 바이너리로 Metadata를 다시 생성/기록하고 수행합니다.
-디버거에서 `app_fault_injection=1`이면 즉시 무한 루프, `=2`이면 주 루프는 계속 돌지만
-작업 진행 보고를 중단합니다. 이 변수는 매 App 시작 시 0으로 초기화됩니다.
+- 전체 CRC 강제 부팅 준비: `Boot_PrepareEx(flags, 1, &metadata)`.
+- 전체 CRC 수동 진단: `Boot_VerifyFirmware()`. 검사 결과만 반환하며 상태를 변경하지 않는다.
+- 주기적 CRC 조건: 부팅 준비 전 `total_boots`가 16의 배수일 때.
+- 이미지 CRC는 두 CRC 필드를 0으로 간주하고 계산한다. Header CRC는 자기 필드만 0으로 간주한다.
+- Metadata CRC 범위는 앞 56바이트이며 마지막 4바이트는 commit이다.
+- Flash 상태 변경 API는 HAL SysTick과 인터럽트가 활성화된 주 실행 흐름에서 호출한다. ISR·동시 호출은 지원하지 않는다.
+- IWDG는 software-start 설정과 `/256`, reload `4095`를 사용한다. 실제 timeout은 LSI 오차에 따라 달라진다.
 
-1. 정상: 약 2초 후 APP_OK, 이후 30초 후 `app_runtime_result == BOOT_SUCCESS` 확인.
-2. 부팅 실패: Confirm 전 `app_fault_injection=1` 설정. IWDG 리셋을 확인하고 매 시도마다
-   같은 주입을 반복합니다. 3번째 실패 뒤 다음 부팅은 APP_FAIL/Recovery 대기여야 합니다.
-3. 런타임 실패: Confirm 후 30초가 되기 전에 주입합니다. 각 재시도에서 다시 Confirm 후
-   주입하여 세 번째 watchdog 리셋 시 Recovery 진입과 `runtime_failures=3`을 확인합니다.
-4. 런타임 복구: 실패 횟수 1 또는 2인 상태에서 정상 동작 30초를 채워 0으로 초기화되는지 확인합니다.
-5. 작업 지연: `app_fault_injection=2` 설정 후 약 1초 뒤 APP_HEALTH_FAULT가 latch되고
-   watchdog 갱신이 중단되는지 확인합니다. 다시 0으로 바꿔도 갱신은 재개되지 않아야 합니다.
-
-Debug 설정에서 IWDG freeze가 켜져 있으면 CPU halt 중에는 timeout이 멈출 수 있습니다.
-리셋 시험에서는 CPU를 계속 실행하고, Bootloader의 RCC flag 읽기 이전에 멈추어
-`boot_reset_flags`/`boot_reset_causes`와 최신 Metadata를 관찰하세요.
+하드웨어 동작 기준: [ST STM32F446 Reference Manual, RM0390](https://www.st.com/resource/en/reference_manual/dm00135183.pdf).
