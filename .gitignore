@@ -1,0 +1,32 @@
+## STM32CubeIDE build output
+Debug/
+Release/
+build/
+
+## Compiled artifacts
+*.o
+*.obj
+*.d
+*.elf
+*.axf
+*.hex
+*.bin
+*.map
+*.list
+*.lst
+*.su
+
+## IDE and workspace metadata
+.metadata/
+.settings/language.settings.xml
+*.launch
+
+## Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+## Logs and temporary files
+*.log
+*.tmp
+*.bak
