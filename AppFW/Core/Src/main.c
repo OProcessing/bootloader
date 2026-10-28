@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "../../../Shared/boot_state.h"
+#include "../../../Shared/boot_watchdog.h"
+#include "../../../Shared/app_health.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,6 +45,12 @@
 
 /* USER CODE BEGIN PV */
 volatile BootResult app_confirm_result = BOOT_BAD_STATE;
+volatile BootResult app_runtime_result = BOOT_BAD_STATE;
+volatile uint32_t app_health_action;
+volatile uint32_t app_main_heartbeat;
+/* Debugger-only fault injection: 1 = hang, 2 = no task progress. Reset clears it. */
+volatile uint32_t app_fault_injection;
+AppHealth app_health;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,6 +76,11 @@ int main(void)
   __DSB();
   __ISB();
   __enable_irq();
+  /* Reconfigure/feed also for direct debugger entry; no IRQ refresh is used. */
+  if (!Boot_WatchdogStart())
+  {
+    Error_Handler();
+  }
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -88,13 +101,9 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-  /* This example has no other peripherals or self-tests yet. Move this call
-   * after real startup health checks when those are added. Never call in ISR. */
-  app_confirm_result = Boot_Confirm();
-  if (app_confirm_result != BOOT_SUCCESS)
-  {
-    Error_Handler();
-  }
+  /* Only main-loop progress is required in this minimal App. Add real critical
+   * tasks to the mask and report completion after their work succeeds. */
+  AppHealth_Init(&app_health, HAL_GetTick(), APP_HEALTH_MAIN_TASK);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -104,6 +113,40 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (app_fault_injection == 1U)
+    {
+      while (1) { __NOP(); } /* Deliberately no watchdog refresh. */
+    }
+    uint32_t now = HAL_GetTick();
+    if (app_fault_injection != 2U)
+    {
+      /* Replace this example work with real application processing. */
+      ++app_main_heartbeat;
+      AppHealth_Progress(&app_health, APP_HEALTH_MAIN_TASK, now);
+    }
+    app_health_action = AppHealth_Poll(&app_health, now);
+    if ((app_health_action & APP_HEALTH_FAULT) == 0U)
+    {
+      if ((app_health_action & APP_HEALTH_CONFIRM) != 0U)
+      {
+        uint32_t storage_started = HAL_GetTick();
+        app_confirm_result = Boot_Confirm();
+        if (app_confirm_result != BOOT_SUCCESS) Error_Handler();
+        AppHealth_MaintenanceComplete(&app_health, storage_started, HAL_GetTick());
+        AppHealth_Confirmed(&app_health, HAL_GetTick());
+      }
+      if ((app_health_action & APP_HEALTH_RUNTIME_STABLE) != 0U)
+      {
+        uint32_t storage_started = HAL_GetTick();
+        app_runtime_result = Boot_RuntimeHealthy();
+        if (app_runtime_result != BOOT_SUCCESS) Error_Handler();
+        AppHealth_MaintenanceComplete(&app_health, storage_started, HAL_GetTick());
+        AppHealth_RuntimeReported(&app_health);
+      }
+      if ((app_health_action & APP_HEALTH_FEED) != 0U) Boot_WatchdogFeed();
+    }
+    /* Once a fault is latched, never resume refresh; IWDG resets the MCU. */
+    HAL_Delay(10U);
   }
   /* USER CODE END 3 */
 }

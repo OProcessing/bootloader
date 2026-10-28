@@ -11,6 +11,7 @@
 #define BOOT_META_B_ADDR       UINT32_C(0x08060000)
 #define BOOT_META_BANK_SIZE    UINT32_C(0x00020000)
 #define BOOT_MAX_ATTEMPTS      3U
+#define BOOT_MAX_RUNTIME_FAILURES 3U
 #define BOOT_METADATA_MAGIC    UINT32_C(0x424F4F54)
 #define BOOT_METADATA_FORMAT   1U
 #define BOOT_METADATA_COMMIT   UINT32_C(0x434F4D54)
@@ -30,13 +31,18 @@ enum {
 enum {
     BOOT_FAILURE_NONE = 0, BOOT_FAILURE_UNCONFIRMED = 1,
     BOOT_FAILURE_ATTEMPTS = 2, BOOT_FAILURE_IMAGE = 3,
-    BOOT_FAILURE_APPLICATION = 4
+    BOOT_FAILURE_APPLICATION = 4,
+    BOOT_FAILURE_STARTUP_WATCHDOG = 5,
+    BOOT_FAILURE_RUNTIME_WATCHDOG = 6,
+    BOOT_FAILURE_POWER_INTERRUPTED = 7,
+    BOOT_FAILURE_STARTUP_RESET = 8,
+    BOOT_FAILURE_RUNTIME_LIMIT = 9
 };
 
 typedef enum {
     BOOT_SUCCESS = 0, BOOT_EMPTY, BOOT_CORRUPT, BOOT_FLASH_ERROR,
     BOOT_BAD_IMAGE, BOOT_ATTEMPTS_EXCEEDED, BOOT_APP_REJECTED,
-    BOOT_BAD_STATE
+    BOOT_BAD_STATE, BOOT_RUNTIME_FAILURES_EXCEEDED, BOOT_WATCHDOG_ERROR
 } BootResult;
 
 /* On-flash ABI: 16 little-endian uint32 words, CRC over first 56 bytes.
@@ -54,7 +60,9 @@ typedef struct {
     uint32_t reset_flags;
     uint32_t reset_causes;
     uint32_t failure_reason;
-    uint32_t reserved[2];
+    /* Former reserved words (zero in stage 2), preserving the 64-byte ABI. */
+    uint32_t runtime_failures;
+    uint32_t last_failure;
     uint32_t record_crc32;
     uint32_t commit;
 } BootMetadata;
@@ -71,6 +79,8 @@ BootResult Boot_MetadataWrite(const BootMetadata *metadata);
 BootResult Boot_InstallImage(uint32_t version, uint32_t size, uint32_t crc32);
 BootResult Boot_Prepare(uint32_t reset_flags, BootMetadata *out);
 BootResult Boot_Confirm(void);
+/* Call only after a sustained healthy runtime interval, not at boot confirm. */
+BootResult Boot_RuntimeHealthy(void);
 BootResult Boot_MarkFailed(void);
 
 /* Backend contract. Never call from an ISR or concurrently. */

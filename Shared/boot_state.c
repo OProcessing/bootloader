@@ -54,6 +54,7 @@ static int valid(const BootMetadata *record)
         record->boot_state >= APP_START && record->boot_state <= APP_FAIL &&
         record->fw_size >= 8U && record->fw_size <= BOOT_APP_MAX_SIZE &&
         record->boot_attempts <= BOOT_MAX_ATTEMPTS &&
+        record->runtime_failures <= BOOT_MAX_RUNTIME_FAILURES &&
         record->record_crc32 == Boot_Crc32(record, offsetof(BootMetadata, record_crc32));
 }
 
@@ -180,26 +181,52 @@ BootResult Boot_Prepare(uint32_t reset_flags, BootMetadata *out)
     BootResult status = Boot_MetadataRead(&record);
     BootResult decision = BOOT_SUCCESS;
     if (status != BOOT_SUCCESS) return status;
+    int had_previous_boot = record.total_boots != 0U;
     record.reset_flags = reset_flags;
     record.reset_causes = Boot_DecodeReset(reset_flags);
     if (record.total_boots != UINT32_MAX) ++record.total_boots;
     if (record.boot_state == APP_FAIL) {
-        decision = record.failure_reason == BOOT_FAILURE_ATTEMPTS
-            ? BOOT_ATTEMPTS_EXCEEDED : BOOT_APP_REJECTED;
+        if (record.failure_reason == BOOT_FAILURE_ATTEMPTS)
+            decision = BOOT_ATTEMPTS_EXCEEDED;
+        else if (record.failure_reason == BOOT_FAILURE_RUNTIME_LIMIT)
+            decision = BOOT_RUNTIME_FAILURES_EXCEEDED;
+        else
+            decision = BOOT_APP_REJECTED;
     } else if (!image_valid(&record)) {
         record.boot_state = APP_FAIL;
         record.failure_reason = BOOT_FAILURE_IMAGE;
         decision = BOOT_BAD_IMAGE;
-    } else if (record.boot_attempts >= BOOT_MAX_ATTEMPTS) {
-        record.boot_state = APP_FAIL;
-        record.failure_reason = BOOT_FAILURE_ATTEMPTS;
-        decision = BOOT_ATTEMPTS_EXCEEDED;
     } else {
-        record.failure_reason = record.boot_state == APP_START
-            ? BOOT_FAILURE_UNCONFIRMED : BOOT_FAILURE_NONE;
-        if (record.boot_state == APP_OK) record.boot_attempts = 0U;
-        record.boot_state = APP_START;
-        ++record.boot_attempts;
+        uint32_t causes = record.reset_causes;
+        int power_reset = (causes & (BOOT_RESET_POR | BOOT_RESET_BOR)) != 0U;
+        int watchdog = !power_reset &&
+            (causes & (BOOT_RESET_IWDG | BOOT_RESET_WWDG)) != 0U;
+        if (record.boot_state == APP_START) {
+            record.last_failure = power_reset ? BOOT_FAILURE_POWER_INTERRUPTED :
+                (watchdog ? BOOT_FAILURE_STARTUP_WATCHDOG : BOOT_FAILURE_STARTUP_RESET);
+            record.failure_reason = record.last_failure;
+        } else {
+            record.boot_attempts = 0U;
+            record.failure_reason = BOOT_FAILURE_NONE;
+            if (watchdog && had_previous_boot) {
+                if (record.runtime_failures < BOOT_MAX_RUNTIME_FAILURES)
+                    ++record.runtime_failures;
+                record.last_failure = BOOT_FAILURE_RUNTIME_WATCHDOG;
+                record.failure_reason = BOOT_FAILURE_RUNTIME_WATCHDOG;
+            }
+        }
+        if (record.runtime_failures >= BOOT_MAX_RUNTIME_FAILURES) {
+            record.boot_state = APP_FAIL;
+            record.failure_reason = BOOT_FAILURE_RUNTIME_LIMIT;
+            decision = BOOT_RUNTIME_FAILURES_EXCEEDED;
+        } else if (record.boot_attempts >= BOOT_MAX_ATTEMPTS) {
+            record.boot_state = APP_FAIL;
+            record.failure_reason = BOOT_FAILURE_ATTEMPTS;
+            decision = BOOT_ATTEMPTS_EXCEEDED;
+        } else {
+            record.boot_state = APP_START;
+            ++record.boot_attempts;
+        }
     }
     status = Boot_MetadataWrite(&record);
     if (status != BOOT_SUCCESS) return status;
@@ -230,5 +257,17 @@ BootResult Boot_MarkFailed(void)
     if (status != BOOT_SUCCESS) return status;
     record.boot_state = APP_FAIL;
     record.failure_reason = BOOT_FAILURE_APPLICATION;
+    record.last_failure = BOOT_FAILURE_APPLICATION;
+    return Boot_MetadataWrite(&record);
+}
+
+BootResult Boot_RuntimeHealthy(void)
+{
+    BootMetadata record;
+    BootResult status = Boot_MetadataRead(&record);
+    if (status != BOOT_SUCCESS) return status;
+    if (record.boot_state != APP_OK) return BOOT_BAD_STATE;
+    if (record.runtime_failures == 0U) return BOOT_SUCCESS;
+    record.runtime_failures = 0U;
     return Boot_MetadataWrite(&record);
 }

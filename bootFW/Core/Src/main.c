@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "../../../Shared/boot_state.h"
+#include "../../../Shared/boot_watchdog.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +51,7 @@ volatile uint32_t boot_reset_flags;
 volatile uint32_t boot_reset_causes;
 volatile BootResult boot_result;
 BootMetadata boot_metadata;
+volatile uint32_t boot_recovery_mode;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -101,8 +103,8 @@ int main(void)
   {
     JumpToApp();
   }
-  /* Missing/corrupt metadata, image failure, or retry exhaustion: stay here.
-   * A future update transport can run in the loop below. */
+  /* Recovery policy for stage 3: remain in the bootloader's main loop. */
+  boot_recovery_mode = 1U;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -112,6 +114,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Safe even if software-start IWDG has not been started. Do not jump again
+     * until a future explicit recovery action registers a verified image. */
+    Boot_WatchdogFeed();
+    HAL_Delay(10U);
   }
   /* USER CODE END 3 */
 }
@@ -182,6 +188,13 @@ void JumpToApp(void)
         ((pc & 1U) == 0U) || (reset_addr < APP_ADDR) || (reset_addr >= APP_END_ADDR))
     {
         boot_result = BOOT_BAD_IMAGE;
+        return;
+    }
+
+    /* Cover App Reset_Handler and initialization, not only its main loop. */
+    if (!Boot_WatchdogStart())
+    {
+        boot_result = BOOT_WATCHDOG_ERROR;
         return;
     }
 

@@ -80,7 +80,7 @@ static void test_states(void)
         assert(Boot_Prepare(1UL << 29, &record) == BOOT_SUCCESS);
         assert(record.boot_state == APP_START && record.boot_attempts == i);
         assert(record.reset_causes == BOOT_RESET_IWDG && record.total_boots == i);
-        if (i > 1) assert(record.failure_reason == BOOT_FAILURE_UNCONFIRMED);
+        if (i > 1) assert(record.failure_reason == BOOT_FAILURE_STARTUP_WATCHDOG);
     }
     assert(Boot_Prepare(1UL << 28, &record) == BOOT_ATTEMPTS_EXCEEDED);
     assert(record.boot_state == APP_FAIL && record.boot_attempts == 3U);
@@ -205,6 +205,81 @@ static void test_provisioned_image(const char *image_path, const char *metadata_
     puts("PASS: actual ARM application .bin + Python-generated metadata + C boot/confirm");
 }
 
+static void test_stage3_reset_policy(void)
+{
+    BootMetadata record;
+    const uint32_t power = 1UL << 27;
+    const uint32_t iwdg = 1UL << 29;
+    const uint32_t wwdg = 1UL << 30;
+    const uint32_t software = 1UL << 28;
+    seed();
+    assert(Boot_Prepare(power, &record) == BOOT_SUCCESS);
+    assert(Boot_RuntimeHealthy() == BOOT_BAD_STATE);
+    assert(Boot_Prepare(iwdg, &record) == BOOT_SUCCESS);
+    assert(record.last_failure == BOOT_FAILURE_STARTUP_WATCHDOG);
+    assert(record.runtime_failures == 0U && record.boot_attempts == 2U);
+    assert(Boot_Confirm() == BOOT_SUCCESS);
+    for (unsigned failure = 1; failure <= BOOT_MAX_RUNTIME_FAILURES; ++failure) {
+        BootResult result = Boot_Prepare(failure == 2U ? wwdg : iwdg, &record);
+        assert(record.runtime_failures == failure);
+        assert(record.last_failure == BOOT_FAILURE_RUNTIME_WATCHDOG);
+        if (failure < BOOT_MAX_RUNTIME_FAILURES) {
+            assert(result == BOOT_SUCCESS && record.boot_attempts == 1U);
+            assert(Boot_Confirm() == BOOT_SUCCESS);
+            assert(Boot_MetadataRead(&record) == BOOT_SUCCESS);
+            assert(record.boot_attempts == 0U && record.runtime_failures == failure);
+        } else {
+            assert(result == BOOT_RUNTIME_FAILURES_EXCEEDED && record.boot_state == APP_FAIL);
+            assert(record.failure_reason == BOOT_FAILURE_RUNTIME_LIMIT);
+            assert(Boot_Confirm() == BOOT_BAD_STATE);
+            assert(Boot_RuntimeHealthy() == BOOT_BAD_STATE);
+            assert(Boot_Prepare(power, &record) == BOOT_RUNTIME_FAILURES_EXCEEDED);
+        }
+    }
+    /* Stable runtime clears its own counter, with no redundant Flash write. */
+    seed();
+    assert(Boot_Prepare(power, &record) == BOOT_SUCCESS);
+    assert(Boot_Confirm() == BOOT_SUCCESS);
+    assert(Boot_Prepare(iwdg, &record) == BOOT_SUCCESS && record.runtime_failures == 1U);
+    assert(Boot_Confirm() == BOOT_SUCCESS);
+    assert(Boot_RuntimeHealthy() == BOOT_SUCCESS);
+    assert(Boot_MetadataRead(&record) == BOOT_SUCCESS && record.runtime_failures == 0U);
+    uint32_t sequence = record.sequence;
+    assert(Boot_RuntimeHealthy() == BOOT_SUCCESS);
+    assert(Boot_MetadataRead(&record) == BOOT_SUCCESS && record.sequence == sequence);
+    assert(record.last_failure == BOOT_FAILURE_RUNTIME_WATCHDOG);
+    /* Normal confirmed resets do not add runtime faults. Mixed power/watchdog
+     * flags are conservatively classified as a power event. */
+    assert(Boot_Prepare(power | iwdg, &record) == BOOT_SUCCESS && record.runtime_failures == 0U);
+    assert(Boot_Prepare(power | iwdg, &record) == BOOT_SUCCESS);
+    assert(record.last_failure == BOOT_FAILURE_POWER_INTERRUPTED);
+    assert(Boot_Confirm() == BOOT_SUCCESS);
+    assert(Boot_Prepare(software, &record) == BOOT_SUCCESS && record.runtime_failures == 0U);
+    assert(Boot_Prepare(software, &record) == BOOT_SUCCESS);
+    assert(record.last_failure == BOOT_FAILURE_STARTUP_RESET);
+    assert(Boot_Prepare(power, &record) == BOOT_SUCCESS && record.boot_attempts == 3U);
+    assert(Boot_Prepare(power, &record) == BOOT_ATTEMPTS_EXCEEDED);
+    /* A torn healthy-runtime update must NOT silently clear the streak. */
+    seed();
+    assert(Boot_Prepare(power, &record) == BOOT_SUCCESS);
+    assert(Boot_Confirm() == BOOT_SUCCESS);
+    assert(Boot_Prepare(iwdg, &record) == BOOT_SUCCESS);
+    assert(Boot_Confirm() == BOOT_SUCCESS);
+    memcpy(saved_flash, flash_memory, sizeof(flash_memory));
+    for (int cut = 0; cut < 16; ++cut) {
+        memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+        writes_left = cut;
+        torn_word = 1;
+        assert(Boot_RuntimeHealthy() == BOOT_FLASH_ERROR);
+        assert(Boot_MetadataRead(&record) == BOOT_SUCCESS && record.runtime_failures == 1U);
+        writes_left = -1;
+        torn_word = 0;
+        assert(Boot_Prepare(iwdg, &record) == BOOT_SUCCESS && record.runtime_failures == 2U);
+    }
+    puts("PASS: startup/runtime reset classification, independent limits, stable-runtime reset,");
+    puts("      power/software/watchdog combinations, 16 interrupted runtime-healthy records");
+}
+
 int main(int argc, char **argv)
 {
     test_states();
@@ -212,6 +287,7 @@ int main(int argc, char **argv)
     test_power_loss(1);
     test_crc_and_sequence();
     test_confirm_power_loss();
+    test_stage3_reset_policy();
     puts("PASS: states, image/metadata CRC, reset flags, retries/confirm, sequence wrap,");
     puts("      80 interrupted writes, interrupted erase and journal recovery");
     if (argc == 3) test_provisioned_image(argv[1], argv[2]);
