@@ -46,6 +46,8 @@ MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
   FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 32K
+  METADATA_A (r)  : ORIGIN = 0x08040000, LENGTH = 128K
+  METADATA_B (r)  : ORIGIN = 0x08060000, LENGTH = 128K
 }
 
 /* Sections */

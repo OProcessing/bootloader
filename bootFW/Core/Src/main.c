@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "../../../Shared/boot_state.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,11 +31,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_ADDR       0x08008000UL
-#define APP_END_ADDR   0x08060000UL
+#define APP_ADDR       BOOT_APP_ADDR
+#define APP_END_ADDR   BOOT_APP_END
 #define SRAM_START     0x20000000UL
 #define SRAM_END       0x20020000UL
-#define METADATA_ADDR  0x08060000UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,7 +45,11 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+/* Inspect these variables in the debugger when recovery mode is entered. */
+volatile uint32_t boot_reset_flags;
+volatile uint32_t boot_reset_causes;
+volatile BootResult boot_result;
+BootMetadata boot_metadata;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,8 +71,11 @@ void JumpToApp(void);
 int main(void)
 {
 
-  /* BEGIN 1 */
-
+  /* USER CODE BEGIN 1 */
+  /* Preserve all reset flags before clearing them for the next boot. */
+  boot_reset_flags = RCC->CSR;
+  boot_reset_causes = Boot_DecodeReset(boot_reset_flags);
+  __HAL_RCC_CLEAR_RESET_FLAGS();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -90,7 +96,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-  JumpToApp();
+  boot_result = Boot_Prepare(boot_reset_flags, &boot_metadata);
+  if (boot_result == BOOT_SUCCESS)
+  {
+    JumpToApp();
+  }
+  /* Missing/corrupt metadata, image failure, or retry exhaustion: stay here.
+   * A future update transport can run in the loop below. */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -146,37 +158,49 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* AAPCS: arguments arrive in r0/r1. No C/stack access after MSP changes. */
+__attribute__((naked, noreturn))
+static void BranchToApp(uint32_t sp __attribute__((unused)),
+                        uint32_t pc __attribute__((unused)))
+{
+    __asm volatile (
+        "msr msp, r0\n"
+        "movs r2, #0\n"
+        "msr control, r2\n"
+        "isb\n"
+        "bx r1\n"
+    );
+}
+
 void JumpToApp(void)
 {
-    uint32_t sp = *(uint32_t *)APP_ADDR;
-    uint32_t pc = *(uint32_t *)(APP_ADDR + 4U);
+    uint32_t sp = *(volatile uint32_t *)APP_ADDR;
+    uint32_t pc = *(volatile uint32_t *)(APP_ADDR + 4U);
     uint32_t reset_addr = pc & ~1UL;
 
-    if ((sp <= SRAM_START) || (sp > SRAM_END) ||
-        ((sp & 7U) != 0U) ||
-        ((pc & 1U) == 0U) ||
-        (reset_addr < APP_ADDR) || (reset_addr >= APP_END_ADDR))
+    if ((sp <= SRAM_START) || (sp > SRAM_END) || ((sp & 7U) != 0U) ||
+        ((pc & 1U) == 0U) || (reset_addr < APP_ADDR) || (reset_addr >= APP_END_ADDR))
     {
+        boot_result = BOOT_BAD_IMAGE;
         return;
     }
 
-    HAL_DeInit();
-    /*
-    전역 인터럽트 비활성화
-    SysTick CTRL / LOAD / VAL 초기화
-    HAL_DeInit()
-    NVIC의 외부 IRQ disable 및 pending clear
-    SysTick / PendSV pending clear
-    VTOR = APP_ADDR
-    __DSB(), __ISB()
-    MSP 설정 및 Reset Handler로 분기
-    */
+    /* All metadata writes finish with interrupts enabled before this point. */
     __disable_irq();
-
+    SysTick->CTRL = 0U;
+    SysTick->LOAD = 0U;
+    SysTick->VAL = 0U;
+    HAL_DeInit();
+    for (uint32_t i = 0U; i < 8U; ++i)
+    {
+        NVIC->ICER[i] = UINT32_MAX;
+        NVIC->ICPR[i] = UINT32_MAX;
+    }
+    SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
     SCB->VTOR = APP_ADDR;
-    __set_MSP(sp);
-
-    ((void (*)(void))pc)();
+    __DSB();
+    __ISB();
+    BranchToApp(sp, pc);
 }
 /* USER CODE END 4 */
 

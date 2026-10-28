@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "../../../Shared/boot_state.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,7 +42,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+volatile BootResult app_confirm_result = BOOT_BAD_STATE;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +63,10 @@ void SystemClock_Config(void);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
+  /* Also support debugger entry directly into the application. */
+  SCB->VTOR = BOOT_APP_ADDR;
+  __DSB();
+  __ISB();
   __enable_irq();
   /* USER CODE END 1 */
 
@@ -84,7 +88,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-
+  /* This example has no other peripherals or self-tests yet. Move this call
+   * after real startup health checks when those are added. Never call in ISR. */
+  app_confirm_result = Boot_Confirm();
+  if (app_confirm_result != BOOT_SUCCESS)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
