@@ -31,7 +31,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_ADDR 0x08008000UL
+#define APP_ADDR       0x08008000UL
+#define APP_END_ADDR   0x08060000UL
+#define SRAM_START     0x20000000UL
+#define SRAM_END       0x20020000UL
+#define METADATA_ADDR  0x08060000UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -146,8 +150,27 @@ void JumpToApp(void)
 {
     uint32_t sp = *(uint32_t *)APP_ADDR;
     uint32_t pc = *(uint32_t *)(APP_ADDR + 4U);
+    uint32_t reset_addr = pc & ~1UL;
+
+    if ((sp <= SRAM_START) || (sp > SRAM_END) ||
+        ((sp & 7U) != 0U) ||
+        ((pc & 1U) == 0U) ||
+        (reset_addr < APP_ADDR) || (reset_addr >= APP_END_ADDR))
+    {
+        return;
+    }
 
     HAL_DeInit();
+    /*
+    전역 인터럽트 비활성화
+    SysTick CTRL / LOAD / VAL 초기화
+    HAL_DeInit()
+    NVIC의 외부 IRQ disable 및 pending clear
+    SysTick / PendSV pending clear
+    VTOR = APP_ADDR
+    __DSB(), __ISB()
+    MSP 설정 및 Reset Handler로 분기
+    */
     __disable_irq();
 
     SCB->VTOR = APP_ADDR;
