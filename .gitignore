@@ -30,3 +30,8 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+
+## Python tools
+__pycache__/
+*.pyc
+*.py

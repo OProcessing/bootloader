@@ -62,6 +62,13 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+  ASSERT(SIZEOF(.isr_vector) <= 0x200, "Vector table overlaps FW Header")
+  .fw_header ORIGIN(FLASH) + 0x200 :
+  {
+    KEEP(*(.fw_header))
+  } >FLASH
+  ASSERT(SIZEOF(.fw_header) == 32, "FW Header must be 32 bytes")
+
   /* The program code and other data into "FLASH" Rom type memory */
   .text :
   {

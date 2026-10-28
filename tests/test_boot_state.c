@@ -9,6 +9,7 @@ static int writes_left = -1;
 static int torn_word;
 static int torn_erase;
 static unsigned erase_count;
+static unsigned image_bulk_reads;
 
 static uint8_t *memory(uint32_t address)
 {
@@ -19,6 +20,8 @@ static uint8_t *memory(uint32_t address)
 void Boot_FlashRead(uint32_t address, void *out, size_t size)
 {
     assert((uint64_t)address + size <= 0x08080000U);
+    if (address >= BOOT_APP_ADDR && address < BOOT_APP_END && size >= 128U)
+        ++image_bulk_reads;
     memcpy(out, memory(address), size);
 }
 int Boot_FlashBegin(void) { return 1; }
@@ -49,14 +52,29 @@ int Boot_FlashEraseBank(unsigned bank)
     return !torn_erase;
 }
 
-static uint32_t image_crc(void) { return Boot_Crc32(memory(BOOT_APP_ADDR), 256); }
+static uint32_t image_crc(void)
+{
+    FirmwareHeader header;
+    memcpy(&header, memory(BOOT_APP_ADDR + FW_HEADER_OFFSET), sizeof(header));
+    return header.image_crc32;
+}
+static void set_image_version(uint32_t version)
+{
+    FirmwareHeader header = {FW_HEADER_MAGIC, FW_HEADER_FORMAT, 768, version, 0, 0,
+                             BOOT_APP_ADDR, sizeof(FirmwareHeader)};
+    memcpy(memory(BOOT_APP_ADDR + FW_HEADER_OFFSET), &header, sizeof(header));
+    header.image_crc32 = Boot_Crc32(memory(BOOT_APP_ADDR), 768);
+    header.header_crc32 = Boot_Crc32(&header, sizeof(header));
+    memcpy(memory(BOOT_APP_ADDR + FW_HEADER_OFFSET), &header, sizeof(header));
+}
 
 static void fresh(void)
 {
     memset(flash_memory, 0xFF, sizeof(flash_memory));
-    for (unsigned i = 0; i < 256; ++i) memory(BOOT_APP_ADDR)[i] = (uint8_t)i;
-    uint32_t vectors[2] = {0x20020000U, BOOT_APP_ADDR + 0x81U};
+    for (unsigned i = 0; i < 768; ++i) memory(BOOT_APP_ADDR)[i] = (uint8_t)i;
+    uint32_t vectors[2] = {0x20020000U, BOOT_APP_ADDR + 0x281U};
     memcpy(memory(BOOT_APP_ADDR), vectors, sizeof(vectors));
+    set_image_version(0x10000U);
     writes_left = -1;
     torn_word = torn_erase = 0;
     erase_count = 0;
@@ -65,7 +83,7 @@ static void fresh(void)
 static void seed(void)
 {
     fresh();
-    assert(Boot_InstallImage(0x10000, 256, image_crc()) == BOOT_SUCCESS);
+    assert(Boot_InstallImage(0x10000, 768, image_crc()) == BOOT_SUCCESS);
 }
 
 static void test_states(void)
@@ -74,7 +92,7 @@ static void test_states(void)
     fresh();
     assert(Boot_Prepare(0, &record) == BOOT_EMPTY);
     assert(Boot_InstallImage(1, BOOT_APP_MAX_SIZE + 1U, 0) == BOOT_BAD_IMAGE);
-    assert(Boot_InstallImage(1, 256, image_crc() ^ 1U) == BOOT_BAD_IMAGE);
+    assert(Boot_InstallImage(1, 768, image_crc() ^ 1U) == BOOT_BAD_IMAGE);
     seed();
     for (unsigned i = 1; i <= BOOT_MAX_ATTEMPTS; ++i) {
         assert(Boot_Prepare(1UL << 29, &record) == BOOT_SUCCESS);
@@ -86,7 +104,8 @@ static void test_states(void)
     assert(record.boot_state == APP_FAIL && record.boot_attempts == 3U);
     assert(Boot_Confirm() == BOOT_BAD_STATE);
     assert(Boot_Prepare(0, &record) == BOOT_ATTEMPTS_EXCEEDED);
-    assert(Boot_InstallImage(2, 256, image_crc()) == BOOT_SUCCESS);
+    set_image_version(2);
+    assert(Boot_InstallImage(2, 768, image_crc()) == BOOT_SUCCESS);
     assert(Boot_Prepare(0, &record) == BOOT_SUCCESS);
     assert(Boot_Confirm() == BOOT_SUCCESS);
     assert(Boot_MetadataRead(&record) == BOOT_SUCCESS);
@@ -125,7 +144,7 @@ static void test_power_loss(int rotate)
             assert(Boot_Prepare(0, &record) == BOOT_FLASH_ERROR);
             /* Simulated reboot must still find the previous committed record. */
             assert(Boot_MetadataRead(&record) == BOOT_SUCCESS);
-            assert(record.sequence == 1U && record.boot_state == APP_OK);
+            assert(record.sequence == 1U && record.boot_state == APP_READY);
             writes_left = -1;
             torn_word = 0;
             assert(Boot_Prepare(0, &record) == BOOT_SUCCESS);
@@ -280,6 +299,61 @@ static void test_stage3_reset_policy(void)
     puts("      power/software/watchdog combinations, 16 interrupted runtime-healthy records");
 }
 
+static void test_stage4_integrity(void)
+{
+    BootMetadata record;
+    seed();
+    image_bulk_reads = 0;
+    assert(Boot_VerifyFirmware() == BOOT_SUCCESS && image_bulk_reads != 0U);
+    image_bulk_reads = 0;
+    assert(Boot_Prepare(1UL << 28, &record) == BOOT_SUCCESS && image_bulk_reads != 0U);
+    image_bulk_reads = 0;
+    assert(Boot_Confirm() == BOOT_SUCCESS && image_bulk_reads == 0U);
+    memcpy(saved_flash, flash_memory, sizeof(flash_memory));
+    const uint32_t flags[] = {1UL << 28, 1UL << 26, 1UL << 27, 1UL << 25,
+                             1UL << 29, 1UL << 30, 0U, 1UL << 31};
+    for (unsigned i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+        image_bulk_reads = 0;
+        assert(Boot_Prepare(flags[i], &record) == BOOT_SUCCESS);
+        assert((image_bulk_reads != 0U) == (i >= 2U));
+    }
+    memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+    image_bulk_reads = 0;
+    assert(Boot_PrepareEx(1UL << 28, 1, &record) == BOOT_SUCCESS && image_bulk_reads != 0U);
+    memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+    assert(Boot_MetadataRead(&record) == BOOT_SUCCESS);
+    record.total_boots = BOOT_CRC_CHECK_INTERVAL;
+    assert(Boot_MetadataWrite(&record) == BOOT_SUCCESS);
+    image_bulk_reads = 0;
+    assert(Boot_Prepare(1UL << 28, &record) == BOOT_SUCCESS && image_bulk_reads != 0U);
+    /* Skip policy intentionally cannot detect body-only damage on a warm reset. */
+    memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+    memory(BOOT_APP_ADDR)[700] ^= 1U;
+    image_bulk_reads = 0;
+    assert(Boot_Prepare(1UL << 28, &record) == BOOT_SUCCESS && image_bulk_reads == 0U);
+    assert(Boot_VerifyFirmware() == BOOT_BAD_IMAGE);
+    memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+    memory(BOOT_APP_ADDR)[700] ^= 1U;
+    assert(Boot_Prepare(1UL << 27, &record) == BOOT_BAD_IMAGE && record.boot_state == APP_FAIL);
+    /* Header CRC/magic and metadata identity are always checked, even if body is skipped. */
+    for (unsigned offset = 0; offset < sizeof(FirmwareHeader); ++offset) {
+        memcpy(flash_memory, saved_flash, sizeof(flash_memory));
+        memory(BOOT_APP_ADDR + FW_HEADER_OFFSET)[offset] ^= 1U;
+        assert(Boot_Prepare(1UL << 28, &record) == BOOT_BAD_IMAGE);
+    }
+    fresh();
+    memory(BOOT_APP_ADDR)[700] ^= 1U;
+    assert(Boot_InstallImage(0x10000, 768, image_crc()) == BOOT_BAD_IMAGE);
+    assert(Boot_MetadataRead(&record) == BOOT_EMPTY);
+    seed();
+    assert(Boot_MetadataRead(&record) == BOOT_SUCCESS);
+    record.fw_version ^= 1U;
+    assert(Boot_MetadataWrite(&record) == BOOT_SUCCESS);
+    assert(Boot_Prepare(0, &record) == BOOT_BAD_IMAGE);
+    puts("PASS: stage-4 header corruption/identity, install verification, conditional/forced/periodic CRC");
+}
+
 int main(int argc, char **argv)
 {
     test_states();
@@ -288,6 +362,7 @@ int main(int argc, char **argv)
     test_crc_and_sequence();
     test_confirm_power_loss();
     test_stage3_reset_policy();
+    test_stage4_integrity();
     puts("PASS: states, image/metadata CRC, reset flags, retries/confirm, sequence wrap,");
     puts("      80 interrupted writes, interrupted erase and journal recovery");
     if (argc == 3) test_provisioned_image(argv[1], argv[2]);

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "firmware_image.h"
 
 #define BOOT_APP_ADDR          UINT32_C(0x08008000)
 #define BOOT_APP_END           UINT32_C(0x08040000)
@@ -13,11 +14,12 @@
 #define BOOT_MAX_ATTEMPTS      3U
 #define BOOT_MAX_RUNTIME_FAILURES 3U
 #define BOOT_METADATA_MAGIC    UINT32_C(0x424F4F54)
-#define BOOT_METADATA_FORMAT   1U
+#define BOOT_METADATA_FORMAT   2U
+#define BOOT_CRC_CHECK_INTERVAL 16U
 #define BOOT_METADATA_COMMIT   UINT32_C(0x434F4D54)
 
 typedef enum {
-    APP_START = 1, APP_OK = 2, APP_FAIL = 3
+    APP_START = 1, APP_OK = 2, APP_FAIL = 3, APP_READY = 4
 } BootState;
 
 /* Bit mask: reset flags can be asserted simultaneously. */
@@ -78,6 +80,9 @@ BootResult Boot_MetadataWrite(const BootMetadata *metadata);
 /* Explicit installation API; does not clear records automatically on errors. */
 BootResult Boot_InstallImage(uint32_t version, uint32_t size, uint32_t crc32);
 BootResult Boot_Prepare(uint32_t reset_flags, BootMetadata *out);
+BootResult Boot_PrepareEx(uint32_t reset_flags, int force_crc, BootMetadata *out);
+/* Always checks header, vectors and FULL image CRC against metadata. */
+BootResult Boot_VerifyFirmware(void);
 BootResult Boot_Confirm(void);
 /* Call only after a sustained healthy runtime interval, not at boot confirm. */
 BootResult Boot_RuntimeHealthy(void);

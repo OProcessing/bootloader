@@ -51,8 +51,8 @@ static int valid(const BootMetadata *record)
     return record->magic == BOOT_METADATA_MAGIC &&
         record->format_version == BOOT_METADATA_FORMAT &&
         record->commit == BOOT_METADATA_COMMIT &&
-        record->boot_state >= APP_START && record->boot_state <= APP_FAIL &&
-        record->fw_size >= 8U && record->fw_size <= BOOT_APP_MAX_SIZE &&
+        record->boot_state >= APP_START && record->boot_state <= APP_READY &&
+        record->fw_size >= FW_MIN_IMAGE_SIZE && record->fw_size <= BOOT_APP_MAX_SIZE &&
         record->boot_attempts <= BOOT_MAX_ATTEMPTS &&
         record->runtime_failures <= BOOT_MAX_RUNTIME_FAILURES &&
         record->record_crc32 == Boot_Crc32(record, offsetof(BootMetadata, record_crc32));
@@ -143,21 +143,36 @@ BootResult Boot_MetadataWrite(const BootMetadata *metadata)
         ? BOOT_SUCCESS : BOOT_FLASH_ERROR;
 }
 
-static int image_valid(const BootMetadata *record)
+static int image_valid(const BootMetadata *record, int full_crc)
 {
     uint32_t vectors[2];
     uint8_t buffer[128];
     uint32_t crc = UINT32_MAX;
-    if (record->fw_size < 8U || record->fw_size > BOOT_APP_MAX_SIZE) return 0;
+    if (record->fw_size < FW_MIN_IMAGE_SIZE || record->fw_size > BOOT_APP_MAX_SIZE) return 0;
+    FirmwareHeader header;
+    Boot_FlashRead(BOOT_APP_ADDR + FW_HEADER_OFFSET, &header, sizeof(header));
+    if (header.magic != FW_HEADER_MAGIC || header.format_version != FW_HEADER_FORMAT ||
+        header.header_size != sizeof(header) || header.load_address != BOOT_APP_ADDR ||
+        header.image_size != record->fw_size || header.fw_version != record->fw_version ||
+        header.image_crc32 != record->fw_crc32) return 0;
+    uint32_t expected_header_crc = header.header_crc32;
+    header.header_crc32 = 0U;
+    if (Boot_Crc32(&header, sizeof(header)) != expected_header_crc) return 0;
     Boot_FlashRead(BOOT_APP_ADDR, vectors, sizeof(vectors));
     uint32_t reset = vectors[1] & ~1UL;
     if (vectors[0] <= UINT32_C(0x20000000) || vectors[0] > UINT32_C(0x20020000) ||
         (vectors[0] & 7U) != 0U || (vectors[1] & 1U) == 0U ||
-        reset < BOOT_APP_ADDR || reset >= BOOT_APP_ADDR + record->fw_size) return 0;
+        reset < BOOT_APP_ADDR + FW_MIN_IMAGE_SIZE || reset >= BOOT_APP_ADDR + record->fw_size) return 0;
+    if (!full_crc) return 1;
     for (uint32_t offset = 0; offset < record->fw_size;) {
         uint32_t size = record->fw_size - offset;
         if (size > sizeof(buffer)) size = sizeof(buffer);
         Boot_FlashRead(BOOT_APP_ADDR + offset, buffer, size);
+        for (uint32_t i = 0; i < size; ++i) {
+            uint32_t position = offset + i;
+            if (position >= FW_HEADER_OFFSET + 16U && position < FW_HEADER_OFFSET + 24U)
+                buffer[i] = 0U;
+        }
         crc = crc_update(crc, buffer, size);
         offset += size;
     }
@@ -167,21 +182,40 @@ static int image_valid(const BootMetadata *record)
 BootResult Boot_InstallImage(uint32_t version, uint32_t size, uint32_t crc32)
 {
     BootMetadata record = {0};
-    record.boot_state = APP_OK;
+    record.boot_state = APP_READY;
     record.fw_version = version;
     record.fw_size = size;
     record.fw_crc32 = crc32;
-    if (!image_valid(&record)) return BOOT_BAD_IMAGE;
+    if (!image_valid(&record, 1)) return BOOT_BAD_IMAGE;
     return Boot_MetadataWrite(&record);
 }
 
 BootResult Boot_Prepare(uint32_t reset_flags, BootMetadata *out)
+{
+    return Boot_PrepareEx(reset_flags, 0, out);
+}
+
+BootResult Boot_VerifyFirmware(void)
+{
+    BootMetadata record;
+    BootResult status = Boot_MetadataRead(&record);
+    if (status != BOOT_SUCCESS) return status;
+    return image_valid(&record, 1) ? BOOT_SUCCESS : BOOT_BAD_IMAGE;
+}
+
+BootResult Boot_PrepareEx(uint32_t reset_flags, int force_crc, BootMetadata *out)
 {
     BootMetadata record;
     BootResult status = Boot_MetadataRead(&record);
     BootResult decision = BOOT_SUCCESS;
     if (status != BOOT_SUCCESS) return status;
     int had_previous_boot = record.total_boots != 0U;
+    uint32_t causes_now = Boot_DecodeReset(reset_flags);
+    int normal_reset = (causes_now & (BOOT_RESET_SOFTWARE | BOOT_RESET_PIN)) != 0U &&
+        (causes_now & ~(BOOT_RESET_SOFTWARE | BOOT_RESET_PIN)) == 0U;
+    int full_crc = force_crc || record.boot_state != APP_OK || !had_previous_boot ||
+        !normal_reset || record.runtime_failures != 0U ||
+        (record.total_boots % BOOT_CRC_CHECK_INTERVAL) == 0U;
     record.reset_flags = reset_flags;
     record.reset_causes = Boot_DecodeReset(reset_flags);
     if (record.total_boots != UINT32_MAX) ++record.total_boots;
@@ -192,7 +226,7 @@ BootResult Boot_Prepare(uint32_t reset_flags, BootMetadata *out)
             decision = BOOT_RUNTIME_FAILURES_EXCEEDED;
         else
             decision = BOOT_APP_REJECTED;
-    } else if (!image_valid(&record)) {
+    } else if (!image_valid(&record, full_crc)) {
         record.boot_state = APP_FAIL;
         record.failure_reason = BOOT_FAILURE_IMAGE;
         decision = BOOT_BAD_IMAGE;
@@ -243,7 +277,7 @@ BootResult Boot_Confirm(void)
     if (status != BOOT_SUCCESS) return status;
     if (record.boot_state == APP_OK) return BOOT_SUCCESS;
     if (record.boot_state != APP_START) return BOOT_BAD_STATE;
-    if (!image_valid(&record)) return BOOT_BAD_IMAGE;
+    if (!image_valid(&record, 0)) return BOOT_BAD_IMAGE;
     record.boot_state = APP_OK;
     record.boot_attempts = 0U;
     record.failure_reason = BOOT_FAILURE_NONE;

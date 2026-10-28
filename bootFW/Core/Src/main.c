@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "../../../Shared/boot_state.h"
 #include "../../../Shared/boot_watchdog.h"
+#include "../../../Shared/boot_protection.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +53,7 @@ volatile uint32_t boot_reset_causes;
 volatile BootResult boot_result;
 BootMetadata boot_metadata;
 volatile uint32_t boot_recovery_mode;
+volatile BootProtectionResult boot_protection_result;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,7 +100,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-  boot_result = Boot_Prepare(boot_reset_flags, &boot_metadata);
+  boot_protection_result = Boot_ProtectBootloader();
+  boot_result = BOOT_BAD_STATE;
+  if (boot_protection_result == BOOT_PROTECTION_OK)
+  {
+    boot_result = Boot_Prepare(boot_reset_flags, &boot_metadata);
+  }
   if (boot_result == BOOT_SUCCESS)
   {
     JumpToApp();

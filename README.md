@@ -4,6 +4,7 @@ STM32CubeIDE의 `bootFW`와 `AppFW` 프로젝트로 구성합니다. 2단계에�
 공유 Metadata ABI, Flash 저널, 부팅 시도 제한, App 확인 처리를 추가했습니다.
 3단계는 IWDG, Reset Cause에 따른 실패 판정, 런타임 실패 누적과 상태 감시를 구현합니다.
 Recovery는 Bootloader `while` 대기로 유지하며 업데이트 통신은 추가하지 않습니다.
+4단계는 이미지 Header, 설치 시 전체 CRC, 조건부 재검증 및 Bootloader WRP를 추가합니다.
 
 ## 메모리 맵
 
@@ -27,7 +28,7 @@ Flash 백엔드는 3.3 V 보드용 WORD programming / `FLASH_VOLTAGE_RANGE_3`
 
 1. Bootloader `main()` 시작에서 `RCC->CSR`를 읽고 reset flags를 지웁니다.
 2. 두 Metadata 저널에서 commit과 CRC가 유효한 최신 sequence를 찾습니다.
-3. 기록된 `fw_size` 범위의 SP, Thumb Reset Vector와 펌웨어 CRC32를 검사합니다.
+3. Header/Metadata 일치, SP, Thumb Reset Vector를 확인하고 CRC 정책에 따라 전체 이미지를 검사합니다.
 4. `APP_START`와 증가한 `boot_attempts`를 Flash에 저장하고 IWDG를 시작한 뒤 App으로 점프합니다.
 5. App 초기화 후 주 루프가 2초 동안 정상 진행하면 `Boot_Confirm()`이 `APP_OK`, attempts=0을 저장합니다.
 6. 확인 전에 리셋되면 다음 실행에서 재시도합니다. 최대 3번 App에 진입하며,
@@ -89,6 +90,9 @@ Confirm 직후 반복해서 watchdog 리셋되는 App은 런타임 실패가 3�
 ## Metadata 저장 규칙
 
 `Shared/boot_state.h`의 `BootMetadata`는 64바이트 고정 구조체입니다.
+4단계 형식 버전은 **2**입니다. 기존 버전 1 레코드는 사용하지 않으므로 최초 전환 시
+새 App과 Metadata를 함께 다시 기록하세요. 신규 이미지는 `APP_READY`로 등록하며,
+실제 부팅 확인을 받은 경우에만 `APP_OK`가 됩니다.
 
 - `boot_state`, `fw_version`, `fw_crc32`, `fw_size`
 - `boot_attempts`, `total_boots`
@@ -99,7 +103,9 @@ Confirm 직후 반복해서 watchdog 리셋되는 App은 런타임 실패가 3�
 reset flags는 동시에 여러 개가 설정될 수 있으므로 단일 원인으로 임의 축약하지 않습니다.
 `fw_version`은 명시한 uint32 값으로 저장하며 버전 비교나 downgrade 제한은 아직 없습니다.
 CRC는 CRC-32/ISO-HDLC (반사 다항식 `0xEDB88320`, init/xorout `0xFFFFFFFF`)이고
-Python `zlib.crc32()`와 같습니다. 이미지 CRC와 레코드 CRC는 별개입니다.
+Python `zlib.crc32()`와 같은 알고리즘입니다. 이미지 CRC는 아래의 CRC 필드 정규화 규칙을
+적용한 바이트열을 대상으로 하며, 원본 BIN에 바로 `zlib.crc32()`한 값과 다릅니다.
+Metadata 레코드 CRC는 이전과 동일하게 앞의 56바이트를 대상으로 합니다.
 
 레코드를 순차 추가하고 마지막에 commit word를 기록합니다. 쓰기 중 전원이 끊긴
 레코드는 무시합니다. 현재 섹터가 차면 **다른 섹터만 지운 후** 새 레코드를 기록하므로,
@@ -136,7 +142,7 @@ python tools/provision_metadata.py build/AppFW/AppFW.bin --fw-version 0x00010000
 5. `build/provision/metadata_b.bin` → `0x08060000`
 6. 모든 쓰기가 끝난 다음 reset/run 합니다.
 
-두 초기 레코드는 같은 이미지 정보를 가지며 sequence는 A=1, B=0입니다.
+두 초기 레코드는 APP_READY 상태의 같은 이미지 정보를 가지며 sequence는 A=1, B=0입니다.
 Metadata 생성에 사용한 **동일한 App .bin**을 기록해야 합니다. App 재빌드/변경 후에는
 새 CRC와 크기로 Metadata도 다시 생성해야 합니다. 기존 저널 위에 초기 64바이트만
 덮어쓰면 안 됩니다. 외부 재등록 시 Sector 6, 7을 모두 지우고 초기 레코드를 기록하세요.
@@ -146,6 +152,94 @@ IDE에서 만든 ELF를 사용한다면 같은 툴체인의 `arm-none-eabi-objco
 명령으로 `.bin`을 추출하여 생성 도구에 전달할 수 있습니다. 별도 빌드의 출력은
 `Debug`가 아닌 `build`에 있으므로 서로 다른 빌드 결과를 섞지 마세요.
 
+## 4단계: FW Header와 무결성
+
+벡터 테이블은 기존 `0x08008000`을 유지하며, Header는 이미지 offset `0x200`,
+즉 `0x08008200`에 32바이트로 배치합니다. 코드는 Header 뒤에서 시작합니다.
+링커 ASSERT가 벡터 테이블과 Header의 중복 및 Header 크기를 확인합니다.
+
+| Header 필드 | 의미 |
+|---|---|
+| `magic` | `0x4657494D` |
+| `format_version` | Header 형식 1 |
+| `image_size` | Flash에 기록할 BIN 전체 크기 |
+| `fw_version` | 명시한 uint32 버전 |
+| `image_crc32` | 전체 이미지 CRC32 |
+| `header_crc32` | Header 자체 CRC32 |
+| `load_address` | `0x08008000` |
+| `header_size` | 32 |
+
+이미지 CRC는 벡터, Header, 코드, 상수, RAM 초기값 및 BIN 안의 간격을 모두 포함합니다.
+CRC 자기 참조를 피하기 위해 image_crc32와 header_crc32의 8바이트만 **0으로 간주**합니다.
+Header CRC는 header_crc32 한 필드만 0으로 간주하여 image_crc32 값까지 보호합니다.
+Header의 크기·버전·이미지 CRC는 Metadata 값과도 일치해야 합니다.
+
+`Boot_InstallImage(version, size, crc)`는 실제 Flash 전체 이미지의 CRC를 계산합니다.
+Header, SP, Reset Vector, 전체 CRC가 모두 통과한 후에만 APP_READY를 저장합니다.
+전송/Flash 기록을 완료한 업데이트 경로에서 호출할 API이며, 이 단계에 통신 기능은 없습니다.
+외부 기록용 `provision_metadata.py`도 Header와 전체 CRC를 검증한 BIN만 받습니다.
+
+### 빌드 후 Header 채우기
+
+`tools/build_firmware.py --fw-version 0x00010000`은 링크 후 `finalize_firmware.py`를 실행해
+**App ELF와 BIN 양쪽을** 수정합니다. IDE에서도 Debug/Release 설정의 post-build 명령에
+동일 처리를 추가했습니다. 기본 버전은 `0x00010000`이며 IDE에서는 post-build 명령의
+`--version` 값을 바꾸세요. Metadata 생성 시에도 같은 버전을 지정해야 합니다.
+
+이미 생성된 ELF를 수동 마무리할 경우:
+
+```powershell
+python tools/finalize_firmware.py AppFW/Debug/AppFW.elf --version 0x00010000 --objcopy "C:/ST/.../tools/bin/arm-none-eabi-objcopy.exe"
+python tools/provision_metadata.py AppFW/Debug/AppFW.bin --fw-version 0x00010000
+```
+
+첫 명령은 실제 설치된 objcopy 경로로 바꿔 실행합니다. IDE의 자동 post-build 처리에
+실패했다면 원본 ELF를 다운로드하지 말고 오류를 해결하거나 위 명령을 실행하세요.
+링크 직후의 미완성 Header는 size/CRC=0이므로 Bootloader가 거부합니다.
+
+### 조건부 CRC 정책
+
+Header 자체 CRC, Header/Metadata 일치와 벡터 범위 검사는 매 부팅 수행합니다.
+전체 이미지 CRC는 다음 조건으로 결정합니다.
+
+| 조건 | 전체 CRC |
+|---|---|
+| 설치 API, 최초 APP_READY, Confirm 미완료 APP_START 재시도 | 수행 |
+| POR/BOR, IWDG/WWDG, low-power, 알 수 없는 Reset Cause | 수행 |
+| 런타임 실패 횟수가 남아 있는 경우 | 수행 |
+| 주기적 재검증 (이전 total_boots가 16의 배수) | 수행 |
+| `Boot_PrepareEx(flags, 1, &metadata)` 강제 요청 | 수행 |
+| APP_OK이며 위 조건이 없고 software/pin reset만 있는 경우 | 생략 |
+
+`Boot_Confirm()`은 Header와 벡터를 확인하지만 직전 Bootloader 검증을 반복해 전체 CRC를
+다시 계산하지 않습니다. `Boot_VerifyFirmware()`는 수동 진단용으로 항상 전체 CRC를
+확인하며, 실패 결과를 반환할 뿐 상태를 직접 변경하지는 않습니다. 부팅 차단까지 하려면
+`Boot_PrepareEx()`의 강제 검증을 사용하세요.
+
+검사를 생략한 warm reset에서는 본문에만 생긴 손상이 다음 전체 검사까지 발견되지 않을 수
+있습니다. 이 지연을 허용하지 않는 정책은 `Boot_PrepareEx()`에서 항상 force_crc=1을 사용하세요.
+CRC는 우발적 손상 검증이며 서명 기반 인증/변조 방지 기능은 아닙니다.
+
+### Bootloader Write Protection
+
+Bootloader는 `Boot_Prepare()` 전에 `Boot_ProtectBootloader()`를 호출합니다.
+SPRMOD=0의 WRP 모드에서 Sector 0·1의 nWRP bit를 0으로 설정하며,
+다른 섹터의 WRP, RDP, BOR, watchdog 옵션은 그대로 둡니다.
+이미 보호된 경우에는 Option Bytes를 다시 쓰지 않습니다.
+SPRMOD=1 (PCROP)이면 모드를 자동 변경하지 않고 Recovery에서 정지합니다.
+
+보호되지 않은 보드의 첫 실행에서는 Option Bytes를 저장하고
+`boot_protection_result=BOOT_PROTECTION_POWER_CYCLE_REQUIRED` 상태로 Recovery에서 대기합니다.
+**전원을 완전히 껐다 켜서 Option Bytes를 다시 로드**한 뒤 정상 부팅을 확인하세요.
+F446의 `HAL_FLASH_OB_Launch()`는 OPTSTRT 기록/대기를 수행하며 자동 reset 함수가 아닙니다.
+하드웨어 기준은 [ST RM0390 Flash 옵션 설명](https://www.st.com/resource/en/reference_manual/dm00135183.pdf)입니다.
+
+WRP가 적용되면 IDE에서 Bootloader를 다시 기록하거나 전체 삭제할 때 보호 오류가 발생할 수
+있습니다. 개발 중 Bootloader 갱신은 STM32CubeProgrammer의 Option Bytes에서
+Sector 0·1의 WRP만 해제하고 필요한 섹터를 기록한 후 실행하세요. 새 Bootloader가 다시
+보호를 설정하면 전원 재인가가 필요합니다. RDP나 PCROP 옵션은 변경하지 마세요.
+보드 연결을 통한 Option Bytes 기록/보호 위반 시험은 별도 수행해야 합니다.
+
 ## API와 관찰할 변수
 
 | API | 용도 |
@@ -153,6 +247,8 @@ IDE에서 만든 ELF를 사용한다면 같은 툴체인의 `arm-none-eabi-objco
 | `Boot_MetadataRead()` | CRC/commit이 유효한 최신 레코드 읽기 |
 | `Boot_MetadataWrite()` | 새 sequence와 CRC를 붙여 append; 저수준 API |
 | `Boot_Prepare()` | 이미지 검증 및 APP_START/시도 횟수 저장 |
+| `Boot_PrepareEx(flags, force_crc, out)` | CRC 강제 검증 선택을 포함한 부팅 준비 |
+| `Boot_VerifyFirmware()` | Header/Metadata/벡터/전체 CRC 수동 검사 |
 | `Boot_Confirm()` | App 정상 확인; APP_OK 및 횟수 초기화; 중복 호출은 추가 쓰기 없음 |
 | `Boot_RuntimeHealthy()` | APP_OK에서 장시간 정상 동작 확인 후 런타임 실패 횟수만 초기화 |
 | `Boot_MarkFailed()` | App 자체 진단 실패 시 APP_FAIL 영구 기록 |
@@ -172,6 +268,7 @@ Bootloader는 Metadata 쓰기를 끝낸 후 IRQ/SysTick/NVIC를 정리하고 App
 `app_confirm_result == BOOT_SUCCESS`이고, Flash 최신 상태는 `APP_OK`, attempts=0입니다.
 Bootloader의 `boot_metadata`는 점프 전 스냅샷이므로 App 확인 후 상태는
 `Boot_MetadataRead()`나 Flash의 최신 레코드로 확인해야 합니다.
+보호 관련 대기 원인은 `boot_protection_result`로 확인합니다.
 
 ## 검증
 
@@ -183,6 +280,9 @@ gcc -std=c11 -O2 -Wall -Wextra -Werror Shared/boot_state.c tests/test_boot_state
 ./build/tests/test_boot_state.exe build/AppFW/AppFW.bin build/provision/metadata_a.bin
 gcc -std=c11 -O2 -Wall -Wextra -Werror Shared/app_health.c tests/test_app_health.c -o build/tests/test_app_health.exe
 ./build/tests/test_app_health.exe
+gcc -std=c11 -O2 -Wall -Wextra -Werror -Itests/protection_mock bootFW/Core/Src/boot_protection.c tests/test_boot_protection.c -o build/tests/test_boot_protection.exe
+./build/tests/test_boot_protection.exe
+python tests/test_firmware_tools.py
 ```
 
 상태 전이, 3회 재시도, 확인 후 초기화, 이미지/Metadata CRC 오류, reset cause 비트,
@@ -191,6 +291,10 @@ sequence wrap, append/섹터 교체/confirm 중 80가지 word 기록 중단과 �
 3단계 테스트는 시작/런타임 reset 판정, 각각의 실패 임계값, 안정 구간 후 초기화,
 런타임 정상 기록 중 16가지 추가 중단, 다중 작업 기한, fault latch, tick wrap,
 Flash 작업의 기한 처리를 확인합니다.
+4단계는 Header 각 바이트 손상, 이미지/Metadata 불일치, 설치 실패 시 미등록,
+일반/비정상/강제/주기적 CRC 경로, ELF/BIN Header 일치와 Python/C 호환성을 검사합니다.
+WRP는 모의 HAL로 대상 섹터·다른 옵션 보존·오류 시 lock 복원을 검사하며,
+실제 보드에서는 Option Bytes 확인과 Sector 0·1 쓰기 거부를 추가 확인해야 합니다.
 
 실제 보드에서는 초기화 후 각 reset 원인, Metadata 쓰기/섹터 교체 중 전원 차단을 확인합니다.
 자동화된 Flash 모사는 실제 저전압 시 Flash 동작을 대체하지 않습니다.
