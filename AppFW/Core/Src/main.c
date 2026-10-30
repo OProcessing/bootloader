@@ -18,12 +18,13 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "../../../Shared/boot_state.h"
 #include "../../../Shared/boot_watchdog.h"
-#include "../../../Shared/app_health.h"
+#include "app_tasks.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,19 +43,20 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 /* USER CODE BEGIN PV */
-volatile BootResult app_confirm_result = BOOT_BAD_STATE;
-volatile BootResult app_runtime_result = BOOT_BAD_STATE;
-volatile uint32_t app_health_action;
-volatile uint32_t app_main_heartbeat;
-/* Debugger-only fault injection: 1 = hang, 2 = no task progress. Reset clears it. */
-volatile uint32_t app_fault_injection;
-AppHealth app_health;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void StartDefaultTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -70,6 +72,7 @@ void SystemClock_Config(void);
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
   /* Also support debugger entry directly into the application. */
   SCB->VTOR = BOOT_APP_ADDR;
@@ -101,10 +104,45 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-  /* Only main-loop progress is required in this minimal App. Add real critical
-   * tasks to the mask and report completion after their work succeeds. */
-  AppHealth_Init(&app_health, HAL_GetTick(), APP_HEALTH_MAIN_TASK);
+  /* Health initialization runs in defaultTask after scheduler startup. */
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  if (osKernelInitialize() != osOK) Error_Handler();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  if (defaultTaskHandle == NULL) Error_Handler();
+  AppTasks_Init();
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -113,40 +151,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (app_fault_injection == 1U)
-    {
-      while (1) { __NOP(); } /* Deliberately no watchdog refresh. */
-    }
-    uint32_t now = HAL_GetTick();
-    if (app_fault_injection != 2U)
-    {
-      /* Replace this example work with real application processing. */
-      ++app_main_heartbeat;
-      AppHealth_Progress(&app_health, APP_HEALTH_MAIN_TASK, now);
-    }
-    app_health_action = AppHealth_Poll(&app_health, now);
-    if ((app_health_action & APP_HEALTH_FAULT) == 0U)
-    {
-      if ((app_health_action & APP_HEALTH_CONFIRM) != 0U)
-      {
-        uint32_t storage_started = HAL_GetTick();
-        app_confirm_result = Boot_Confirm();
-        if (app_confirm_result != BOOT_SUCCESS) Error_Handler();
-        AppHealth_MaintenanceComplete(&app_health, storage_started, HAL_GetTick());
-        AppHealth_Confirmed(&app_health, HAL_GetTick());
-      }
-      if ((app_health_action & APP_HEALTH_RUNTIME_STABLE) != 0U)
-      {
-        uint32_t storage_started = HAL_GetTick();
-        app_runtime_result = Boot_RuntimeHealthy();
-        if (app_runtime_result != BOOT_SUCCESS) Error_Handler();
-        AppHealth_MaintenanceComplete(&app_health, storage_started, HAL_GetTick());
-        AppHealth_RuntimeReported(&app_health);
-      }
-      if ((app_health_action & APP_HEALTH_FEED) != 0U) Boot_WatchdogFeed();
-    }
-    /* Once a fault is latched, never resume refresh; IWDG resets the MCU. */
-    HAL_Delay(10U);
+    /* Scheduler exit/failure: do not feed IWDG; reset returns to bootloader. */
+    __NOP();
   }
   /* USER CODE END 3 */
 }
@@ -196,6 +202,47 @@ void SystemClock_Config(void)
 
 /* USER CODE END 4 */
 
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  AppTasks_RunHealth(argument);
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
@@ -210,8 +257,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.

@@ -28,7 +28,8 @@ int Boot_FlashBegin(void) { return 1; }
 void Boot_FlashEnd(void) { }
 int Boot_FlashProgramWord(uint32_t address, uint32_t word)
 {
-    assert(address >= BOOT_META_A_ADDR && (address & 3U) == 0U);
+    assert(address >= BOOT_META_A_ADDR &&
+           address <= BOOT_META_B_ADDR + BOOT_META_BANK_SIZE - 4U && (address & 3U) == 0U);
     uint32_t old;
     memcpy(&old, memory(address), 4);
     assert((old & word) == word);
@@ -212,7 +213,7 @@ static void test_provisioned_image(const char *image_path, const char *metadata_
     FILE *image = fopen(image_path, "rb");
     assert(image != NULL);
     size_t size = fread(memory(BOOT_APP_ADDR), 1, BOOT_APP_MAX_SIZE, image);
-    assert(feof(image));
+    assert(fgetc(image) == EOF);
     fclose(image);
     FILE *metadata = fopen(metadata_path, "rb");
     assert(metadata != NULL);

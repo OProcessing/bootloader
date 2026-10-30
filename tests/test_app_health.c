@@ -46,6 +46,7 @@ int main(void)
     assert(progress(&health, 0) == APP_HEALTH_FEED);
     assert(progress(&health, 1000) == APP_HEALTH_FEED);
     assert(progress(&health, 1001) == APP_HEALTH_FAULT); /* Missing second task. */
+    assert(health.failed_tasks == 2U);
     AppHealth_Init(&health, 0, APP_HEALTH_MAIN_TASK);
     for (uint32_t now = 0; now < 8000; now += 500) {
         assert((progress(&health, now) & APP_HEALTH_FAULT) == 0U);
@@ -67,6 +68,31 @@ int main(void)
     /* Maintenance must not hide a deadline already missed before it started. */
     AppHealth_MaintenanceComplete(&health, 13001, 15000);
     assert(progress(&health, 15000) == APP_HEALTH_FAULT);
+    /* Three worker completion streams, single owner. Simulated periods:
+     * sensor/control 100 ms, comms 500 ms, supervisor 20 ms. */
+    AppHealth_Init(&health, 0, 7U);
+    for (uint32_t now = 0; now <= 32000; now += 20) {
+        if (now % 100U == 0U) {
+            AppHealth_Progress(&health, 1U, now);
+            AppHealth_Progress(&health, 2U, now);
+        }
+        /* Use 500 ms here to align with the simulated 20 ms dispatch grid. */
+        if (now % 500U == 0U) AppHealth_Progress(&health, 4U, now);
+        uint32_t action = AppHealth_Poll(&health, now);
+        assert((action & APP_HEALTH_FAULT) == 0U);
+        if (action & APP_HEALTH_CONFIRM) AppHealth_Confirmed(&health, now);
+        if (action & APP_HEALTH_RUNTIME_STABLE) AppHealth_RuntimeReported(&health);
+    }
+    assert(health.confirmed && health.runtime_reported && health.failed_tasks == 0U);
+    for (uint32_t now = 32020; now <= 33020; now += 20) {
+        AppHealth_Progress(&health, 1U, now);
+        AppHealth_Progress(&health, 2U, now);
+        AppHealth_Poll(&health, now);
+    }
+    assert(health.fault_latched && health.failed_tasks == 4U);
+    AppHealth_Progress(&health, 4U, 33021);
+    assert(AppHealth_Poll(&health, 33021) == APP_HEALTH_FAULT);
+    puts("PASS: three worker reports, single missing worker identification and irreversible fault latch");
     puts("PASS: startup grace/deadline, task progress, latched failure, 30s runtime health,");
     puts("      multiple tasks, tick wrap and bounded Flash maintenance");
     return 0;

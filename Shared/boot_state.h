@@ -5,18 +5,23 @@
 #include <stdint.h>
 #include "firmware_image.h"
 
-#define BOOT_APP_ADDR          UINT32_C(0x08008000)
-#define BOOT_APP_END           UINT32_C(0x08040000)
+#define BOOT_APP_ADDR          UINT32_C(0x08010000)
+#define BOOT_APP_END           UINT32_C(0x08080000)
 #define BOOT_APP_MAX_SIZE      (BOOT_APP_END - BOOT_APP_ADDR)
-#define BOOT_META_A_ADDR       UINT32_C(0x08040000)
-#define BOOT_META_B_ADDR       UINT32_C(0x08060000)
-#define BOOT_META_BANK_SIZE    UINT32_C(0x00020000)
+#define BOOT_META_A_ADDR       UINT32_C(0x08008000)
+#define BOOT_META_B_ADDR       UINT32_C(0x0800C000)
+#define BOOT_META_BANK_SIZE    UINT32_C(0x00004000)
 #define BOOT_MAX_ATTEMPTS      3U
 #define BOOT_MAX_RUNTIME_FAILURES 3U
 #define BOOT_METADATA_MAGIC    UINT32_C(0x424F4F54)
 #define BOOT_METADATA_FORMAT   2U
 #define BOOT_CRC_CHECK_INTERVAL 16U
 #define BOOT_METADATA_COMMIT   UINT32_C(0x434F4D54)
+
+_Static_assert(BOOT_META_A_ADDR + BOOT_META_BANK_SIZE == BOOT_META_B_ADDR,
+               "Metadata banks must be contiguous");
+_Static_assert(BOOT_META_B_ADDR + BOOT_META_BANK_SIZE == BOOT_APP_ADDR,
+               "Metadata must end at the application boundary");
 
 typedef enum {
     APP_START = 1, APP_OK = 2, APP_FAIL = 3, APP_READY = 4

@@ -18,8 +18,10 @@ void AppHealth_Progress(AppHealth *health, uint32_t tasks, uint32_t now)
     for (unsigned i = 0; i < APP_HEALTH_MAX_TASKS; ++i) {
         if (tasks & (1U << i)) {
             /* A late completion must not conceal an already missed deadline. */
-            if ((uint32_t)(now - health->last_progress[i]) > APP_HEALTH_PROGRESS_MS)
+            if ((uint32_t)(now - health->last_progress[i]) > APP_HEALTH_PROGRESS_MS) {
                 health->fault_latched = 1U;
+                health->failed_tasks |= 1U << i;
+            }
             health->last_progress[i] = now;
         }
     }
@@ -31,8 +33,10 @@ uint32_t AppHealth_Poll(AppHealth *health, uint32_t now)
     if (health->fault_latched) return APP_HEALTH_FAULT;
     for (unsigned i = 0; i < APP_HEALTH_MAX_TASKS; ++i) {
         if ((health->required_tasks & (1U << i)) &&
-            (uint32_t)(now - health->last_progress[i]) > APP_HEALTH_PROGRESS_MS)
+            (uint32_t)(now - health->last_progress[i]) > APP_HEALTH_PROGRESS_MS) {
             health->fault_latched = 1U;
+            health->failed_tasks |= 1U << i;
+        }
     }
     if (!health->confirmed &&
         (uint32_t)(now - health->started_at) >= APP_HEALTH_STARTUP_LIMIT_MS)

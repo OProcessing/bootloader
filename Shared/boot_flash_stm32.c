@@ -1,6 +1,7 @@
 /* STM32F446RE, 3.3 V supply (FLASH_VOLTAGE_RANGE_3 requires 2.7-3.6 V).
  * Flash is single-bank: instruction fetch stalls during program/erase.
- * Call in thread mode with SysTick running; HAL uses it for timeout handling.
+ * Call in thread mode with the HAL tick interrupt running (App: TIM6,
+ * bootloader: SysTick); HAL uses this time base for timeout handling.
  * No ISR may write Flash or access this module concurrently. */
 #include "boot_state.h"
 #include "stm32f4xx_hal.h"
@@ -53,7 +54,7 @@ int Boot_FlashEraseBank(unsigned bank)
     uint32_t error;
     if (bank > 1U) return 0;
     erase.TypeErase = FLASH_TYPEERASE_SECTORS;
-    erase.Sector = bank == 0U ? FLASH_SECTOR_6 : FLASH_SECTOR_7;
+    erase.Sector = bank == 0U ? FLASH_SECTOR_2 : FLASH_SECTOR_3;
     erase.NbSectors = 1U;
     erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
     HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase, &error);

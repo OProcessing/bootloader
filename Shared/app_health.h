@@ -26,9 +26,11 @@ typedef struct {
     uint32_t confirmed;
     uint32_t runtime_reported;
     uint32_t fault_latched;
+    uint32_t failed_tasks;
 } AppHealth;
 
 void AppHealth_Init(AppHealth *health, uint32_t now, uint32_t required_tasks);
+/* Single-owner API: RTOS workers must report through the supervisor queue. */
 /* Report real work completion, never simply from a periodic interrupt. */
 void AppHealth_Progress(AppHealth *health, uint32_t tasks, uint32_t now);
 uint32_t AppHealth_Poll(AppHealth *health, uint32_t now);

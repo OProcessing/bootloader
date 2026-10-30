@@ -45,10 +45,10 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  /* Sector 0-1: bootloader; 2-5: application; 6-7: independent journals. */
-  FLASH      (rx) : ORIGIN = 0x08008000, LENGTH = 224K
-  METADATA_A (r)  : ORIGIN = 0x08040000, LENGTH = 128K
-  METADATA_B (r)  : ORIGIN = 0x08060000, LENGTH = 128K
+  /* Sector 0-1: bootloader; 2-3: metadata; 4-7: application. */
+  FLASH      (rx) : ORIGIN = 0x08010000, LENGTH = 448K
+  METADATA_A (r)  : ORIGIN = 0x08008000, LENGTH = 16K
+  METADATA_B (r)  : ORIGIN = 0x0800C000, LENGTH = 16K
 }
 
 /* Sections */
